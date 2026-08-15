@@ -1,0 +1,417 @@
+name: MediaCrawler & Cloudflare Tunnel (Windows RDP Loop) - by Redwanul Haque
+
+on:
+  workflow_dispatch:
+    inputs:
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+
+concurrency:
+  group: mediacrawler-rdp-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  secure-rdp:
+    runs-on: windows-2025
+    timeout-minutes: 360
+    steps:
+      # ───────────────────────────────────────────────
+      # Step 1: Validate Required Secrets
+      # ───────────────────────────────────────────────
+      - name: 🔑 Validate Required Secrets
+        id: validate
+        run: |
+          $token = "${{ secrets.GH_PAT }}"
+          $tsKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+
+          if (-not $token -or $token.Length -lt 10) {
+              Write-Error "❌ GH_PAT secret is not set! Go to repo Settings > Secrets > Actions and add GH_PAT."
+              exit 1
+          }
+          if (-not $tsKey -or $tsKey.Length -lt 5) {
+              Write-Error "❌ TAILSCALE_AUTH_KEY secret is not set! Go to repo Settings > Secrets > Actions and add TAILSCALE_AUTH_KEY."
+              exit 1
+          }
+          Write-Host "✅ GH_PAT and TAILSCALE_AUTH_KEY secrets are configured."
+
+      # ───────────────────────────────────────────────
+      # Step 2: Setup User & Folders
+      # ───────────────────────────────────────────────
+      - name: 👤 Create User & Folders
+        id: user-setup
+        run: |
+          # RDP credentials
+          $u = "SOURAV"
+          $p = "Redwanul@#1"
+
+          # Save for later steps
+          "RDP_USER=$u" | Out-File -Append $env:GITHUB_ENV
+          "RDP_PASS=$p" | Out-File -Append $env:GITHUB_ENV
+
+          # 📁 Pre-create writable folders on Temp Storage (D:\<username>\...)
+          $folders = @(
+              "Desktop",
+              "Documents",
+              "Downloads",
+              "Pictures",
+              "Videos",
+              "Music",
+              "Apps",
+              "Audios",
+              "Projects",
+              "Temp"
+          )
+          foreach ($name in $folders) {
+              $f = Join-Path "D:\$u" $name
+              if (-Not (Test-Path -Path $f)) {
+                  New-Item -Path $f -ItemType Directory -Force | Out-Null
+                  Write-Host "  📂 Created: $f"
+              }
+          }
+
+          # Create local user
+          $securePass = ConvertTo-SecureString $p -AsPlainText -Force
+          try {
+              if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
+                  Set-LocalUser -Name $u -Password $securePass
+                  Enable-LocalUser -Name $u
+                  Write-Host "✅ User '$u' updated."
+              } else {
+                  New-LocalUser -Name $u -Password $securePass -PasswordNeverExpires -AccountNeverExpires | Out-Null
+                  Write-Host "✅ User '$u' created."
+              }
+          } catch {
+              Write-Error "❌ User creation failed: $_"
+              exit 1
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member $u -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
+          Write-Host "✅ User '$u' added to Administrators & Remote Desktop Users."
+
+          # Create Desktop shortcuts so user sees storage & MediaCrawler on RDP login
+          $userDesktop = "C:\Users\$u\Desktop"
+          if (-not (Test-Path $userDesktop)) {
+              New-Item -Path $userDesktop -ItemType Directory -Force | Out-Null
+          }
+          $wscript = New-Object -ComObject WScript.Shell
+          $shortcutD = $wscript.CreateShortcut("$userDesktop\Temp Storage (D Drive).lnk")
+          $shortcutD.TargetPath = "D:\$u"
+          $shortcutD.Save()
+
+          $shortcutMC = $wscript.CreateShortcut("$userDesktop\MediaCrawler Folder.lnk")
+          $shortcutMC.TargetPath = "C:\mediacrawler"
+          $shortcutMC.Save()
+
+      # ───────────────────────────────────────────────
+      # Step 3: Configure RDP
+      # ───────────────────────────────────────────────
+      - name: ⚙️ Configure RDP & Display
+        run: |
+          # Enable RDP
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Disable NLA (Network Level Authentication) for easier access
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name "SecurityLayer" -Value 0 -Force
+
+          # Set max color depth (32-bit)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+              -Name "ColorDepth" -Value 4 -Force
+
+          # Allow multiple RDP sessions per user
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+              -Name "fSingleSessionPerUser" -Value 0 -Force
+
+          # Configure screen resolution (1920x1080)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Video\{*}\0000' `
+              -Name "DefaultSettings.XResolution" -Value 1920 -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Video\{*}\0000' `
+              -Name "DefaultSettings.YResolution" -Value 1080 -ErrorAction SilentlyContinue
+
+          # Firewall: clean up old rule, add new one
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+              dir=in action=allow protocol=TCP localport=3389 | Out-Null
+
+          # Restart RDP service
+          Restart-Service -Name TermService -Force
+
+          # Prevent auto-lock & screen timeout
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+
+          Write-Host "✅ RDP configured (1920x1080, 32-bit color, no NLA, no screen timeout)."
+
+      # ───────────────────────────────────────────────
+      # Step 4: Install Tailscale
+      # ───────────────────────────────────────────────
+      - name: 🌐 Install & Connect Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.98.4-amd64.msi"
+
+          Write-Host "⬇️ Downloading Tailscale from $tsUrl..."
+          Invoke-WebRequest -Uri $tsUrl -OutFile "$env:TEMP\ts.msi" -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$env:TEMP\ts.msi`"", "/quiet", "/norestart" -Wait
+          Remove-Item "$env:TEMP\ts.msi" -Force
+
+          Write-Host "✅ Tailscale installed."
+
+          # Connect to Tailscale network
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+              --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+              --hostname=gh-runner-mediacrawler-${{ github.run_number }} `
+              --accept-routes
+
+          # Wait for Tailscale IP with retry
+          $tsIP = $null; $r = 0
+          while (-not $tsIP -and $r -lt 20) {
+              $rawIp = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              if ($rawIp) {
+                  $tsIP = (($rawIp | Out-String).Trim() -split "`r?`n")[0].Trim()
+              }
+              if (-not $tsIP) { Start-Sleep -Seconds 3; $r++ }
+          }
+
+          if (-not $tsIP) {
+              Write-Error "❌ Tailscale failed to obtain IP after $r retries."
+              exit 1
+          }
+
+          # Save IP for later steps
+          "TS_IP=$tsIP" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "✅ Tailscale connected: $tsIP"
+
+      # ───────────────────────────────────────────────
+      # Step 5: Setup MediaCrawler & Cloudflare Tunnel
+      # ───────────────────────────────────────────────
+      - name: 🚀 Setup MediaCrawler & Cloudflare Tunnel
+        id: mediacrawler-cf
+        run: |
+          # 1. Download & Extract MediaCrawler
+          $zipUrl = "https://pub-9ac4fabf50b043d189908267ca0d8599.r2.dev/YT-DLP/MediaCrawler/Updated/mediacrawler.zip"
+          $zipPath = "$env:TEMP\mediacrawler.zip"
+          $extractPath = "C:\mediacrawler"
+          $mcLog = "$env:TEMP\mediacrawler.log"
+
+          Write-Host "⬇️ Downloading MediaCrawler from $zipUrl..."
+          Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
+
+          Write-Host "📦 Extracting MediaCrawler archive to $extractPath..."
+          if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
+          Expand-Archive -Path $zipPath -DestinationPath $extractPath -Force
+          Remove-Item $zipPath -Force
+
+          # Locate setup-and-run.bat inside extracted folder
+          $batFile = Get-ChildItem -Path $extractPath -Filter "setup-and-run.bat" -Recurse | Select-Object -First 1
+          if (-not $batFile) {
+              Write-Error "❌ setup-and-run.bat not found inside extracted folder!"
+              exit 1
+          }
+
+          $mcDir = $batFile.DirectoryName
+          Write-Host "▶️ Starting MediaCrawler server via $($batFile.FullName)..."
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"`"$($batFile.FullName)`" > `"$mcLog`" 2>&1`"" -WorkingDirectory $mcDir -WindowStyle Hidden
+
+          # 2. Wait for MediaCrawler HTTP port 8000 to become active
+          Write-Host "⏳ Waiting for MediaCrawler server startup on port 8000..."
+          $serverReady = $false
+          for ($i = 1; $i -le 30; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                  $resp = Invoke-WebRequest -Uri "http://localhost:8000" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+                  if ($resp.StatusCode -ge 200 -and $resp.StatusCode -lt 500) {
+                      $serverReady = $true
+                      Write-Host "✅ MediaCrawler server responding on port 8000 (attempt $i)!"
+                      break
+                  }
+              } catch {
+                  $tcp = Test-NetConnection -ComputerName "127.0.0.1" -Port 8000 -WarningAction SilentlyContinue
+                  if ($tcp.TcpTestSucceeded) {
+                      $serverReady = $true
+                      Write-Host "✅ MediaCrawler TCP port 8000 is open (attempt $i)!"
+                      break
+                  }
+              }
+          }
+
+          if (-not $serverReady) {
+              Write-Host "⚠️ MediaCrawler port 8000 not responding yet. Log output preview:"
+              if (Test-Path $mcLog) {
+                  Get-Content -Path $mcLog -Tail 20 -ErrorAction SilentlyContinue | Write-Host
+              }
+          }
+
+          # 3. Download & Setup Cloudflare Tunnel directly (Reliable & Fast)
+          Write-Host "🌐 Setting up Cloudflare Tunnel CLI (cloudflared)..."
+          $cfBinDir = "$env:ProgramData\cloudflared"
+          $cfExe = "$cfBinDir\cloudflared.exe"
+          if (-not (Test-Path $cfExe)) {
+              New-Item -ItemType Directory -Force -Path $cfBinDir | Out-Null
+              $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+              Invoke-WebRequest -Uri $cfUrl -OutFile $cfExe -UseBasicParsing
+          }
+          Write-Host "✅ cloudflared binary ready at: $cfExe"
+
+          # 4. Start Cloudflare Tunnel pointing to http://localhost:8000
+          $cfLog = "$env:TEMP\cloudflared.log"
+          if (Test-Path $cfLog) { Remove-Item $cfLog -Force }
+
+          Write-Host "🚀 Launching cloudflared tunnel --url http://localhost:8000 ..."
+          Start-Process -FilePath $cfExe -ArgumentList "tunnel", "--url", "http://localhost:8000", "--logfile", "`"$cfLog`"" -WindowStyle Hidden
+
+          # 5. Extract *.trycloudflare.com URL from log with retry loop
+          $cfUrlResult = $null
+          $retries = 0
+          while (-not $cfUrlResult -and $retries -lt 30) {
+              Start-Sleep -Seconds 2
+              if (Test-Path $cfLog) {
+                  $logContent = Get-Content -Path $cfLog -Raw -ErrorAction SilentlyContinue
+                  if ($logContent -match '(https://[a-zA-Z0-9-]+\.trycloudflare\.com)') {
+                      $cfUrlResult = $matches[1]
+                  }
+              }
+              $retries++
+          }
+
+          if ($cfUrlResult) {
+              Write-Host ""
+              Write-Host "================================================================="
+              Write-Host "🌐 CLOUDFLARE TUNNEL URL: $cfUrlResult"
+              Write-Host "================================================================="
+              Write-Host ""
+              "CF_TUNNEL_URL=$cfUrlResult" | Out-File -Append $env:GITHUB_ENV
+          } else {
+              Write-Host "⚠️ Cloudflare Tunnel URL could not be extracted within time limit."
+              if (Test-Path $cfLog) {
+                  Get-Content -Path $cfLog -Tail 15 -ErrorAction SilentlyContinue | Write-Host
+              }
+              "CF_TUNNEL_URL=Not Available" | Out-File -Append $env:GITHUB_ENV
+          }
+
+      # ───────────────────────────────────────────────
+      # Step 6: Send Credentials via Telegram
+      # ───────────────────────────────────────────────
+      - name: 📲 Send Credentials to Telegram
+        run: |
+          $botToken = "${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          $chatId   = "${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if (-not $botToken -or -not $chatId) {
+              Write-Host "⚠️ Telegram secrets not set. Skipping notification."
+          } else {
+              $nl = "`n"
+              $message  = "🖥️ <b>RDP Server Ready!</b>" + $nl
+              $message += "━━━━━━━━━━━━━━━━━━━━" + $nl
+              $message += "🌐 Address: <code>$($env:TS_IP)</code>" + $nl
+              $message += "🔗 Cloudflare: <code>$($env:CF_TUNNEL_URL)</code>" + $nl
+              $message += "👤 Username: <code>$($env:RDP_USER)</code>" + $nl
+              $message += "🔑 Password: <code>$($env:RDP_PASS)</code>" + $nl
+              $message += "━━━━━━━━━━━━━━━━━━━━" + $nl
+              $message += "📋 Connect: <code>mstsc /v:$($env:TS_IP)</code>" + $nl
+              $message += "⏱️ Uptime: ~5h 40m" + $nl
+              $message += "🔁 Run: #${{ github.run_number }}" + $nl
+              $message += "━━━━━━━━━━━━━━━━━━━━" + $nl
+              $message += "⚡ <i>Powered by Redwanul Haque</i>"
+
+              $body = @{
+                  chat_id    = $chatId
+                  text       = $message
+                  parse_mode = "HTML"
+              } | ConvertTo-Json -Depth 5
+
+              try {
+                  Invoke-RestMethod -Method POST `
+                      -Uri "https://api.telegram.org/bot$botToken/sendMessage" `
+                      -ContentType "application/json" `
+                      -Body $body
+                  Write-Host "✅ Telegram notification sent!"
+              } catch {
+                  Write-Host "⚠️ Telegram notification failed: $_"
+              }
+          }
+
+      # ───────────────────────────────────────────────
+      # Step 7: Print Credentials & Keep Alive
+      # ───────────────────────────────────────────────
+      - name: 📢 Print Credentials & Keep Alive
+        run: |
+          Write-Host ""
+          Write-Host "================================================================="
+          Write-Host "⚡ Powered by Redwanul Haque"
+          Write-Host "-----------------------------------------------------------------"
+          Write-Host "Address   : $env:TS_IP"
+          Write-Host "Cloudflare: $env:CF_TUNNEL_URL"
+          Write-Host "Username  : $env:RDP_USER"
+          Write-Host "Password  : $env:RDP_PASS"
+          Write-Host "RDP       : mstsc /v:$env:TS_IP (Port 3389)"
+          Write-Host "================================================================="
+          Write-Host ""
+
+          # ⏱️ Protected Runtime Production Loop (5 Hours 40 Minutes)
+          $m = 340
+          for ($i = 1; $i -le $m; $i++) {
+              $l = $m - $i
+              $pct = [math]::Round(($i / $m) * 100)
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] ⏱️ $l min remaining ($pct% elapsed)"
+              Start-Sleep -Seconds 60
+          }
+
+      # ───────────────────────────────────────────────
+      # Step 8: Chain Rotation
+      # ───────────────────────────────────────────────
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          $token = "${{ secrets.GH_PAT }}"
+          $inputLoops = "${{ github.event.inputs.loops }}"
+          $loops = if (-not $inputLoops) { 4 } else { [int]$inputLoops }
+
+          if ($loops -le 1) {
+              Write-Host "🎯 Chain Finished Successfully. Total iterations completed."
+              exit 0
+          }
+
+          if (-not $token -or $token.Length -lt 10) {
+              Write-Error "❌ GH_PAT secret is missing. Cannot dispatch next iteration."
+              exit 1
+          }
+
+          $headers = @{
+              Authorization          = "Bearer $token"
+              Accept                 = "application/vnd.github+json"
+              "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $next = $loops - 1
+          Write-Host "🔁 Dispatching next iteration: $next remaining..."
+
+          $body = @{
+              ref    = "${{ github.ref_name }}"
+              inputs = @{ loops = "$next" }
+          } | ConvertTo-Json -Depth 5
+
+          try {
+              Invoke-RestMethod -Method POST `
+                  -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches" `
+                  -Headers $headers `
+                  -Body $body `
+                  -ContentType "application/json"
+              Write-Host "✅ Secured handoff executed to loop iteration: $next"
+          } catch {
+              Write-Error "❌ Chain dispatch failed: $_"
+              exit 1
+          }

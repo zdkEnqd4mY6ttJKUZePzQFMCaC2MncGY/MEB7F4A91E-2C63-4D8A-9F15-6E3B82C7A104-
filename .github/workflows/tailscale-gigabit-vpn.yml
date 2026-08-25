@@ -1,0 +1,295 @@
+name: WireGuard / Tailscale Gigabit VPN (Ubuntu Loop) - by Redwanul Haque
+# Suggested filename: tailscale-gigabit-vpn.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "⏱️ Runtime in minutes (max 345)"
+        required: false
+        default: "340"
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+
+concurrency:
+  group: vpn-server-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  vpn-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ───────────────────────────────────────────────
+      # Step 1: Validate GitHub Token
+      # ───────────────────────────────────────────────
+      - name: 🔑 Validate GitHub Token
+        id: validate
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is not set! Go to repo Settings > Secrets > Actions and add GH_PAT."
+            exit 1
+          fi
+          echo "✅ GH_PAT secret is configured (${#token} chars)."
+
+      # ───────────────────────────────────────────────
+      # Step 2: System Specs & BBR Gigabit Network Tuning
+      # ───────────────────────────────────────────────
+      - name: ⚡ Optimize Linux Kernel for Gigabit Speed
+        run: |
+          echo "=============================================="
+          echo "🖥️ Runner Specs & Network Optimization"
+          echo "CPU Cores : $(nproc)"
+          echo "RAM       : $(free -h | awk '/^Mem:/ {print $2}')"
+          echo "Disk Free : $(df -h / | awk 'NR==2 {print $4}')"
+          echo "=============================================="
+
+          echo "🚀 Enabling BBR Congestion Control & High-Throughput Buffers..."
+          sudo modprobe tcp_bbr 2>/dev/null || true
+          sudo sysctl -w net.core.default_qdisc=fq || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sudo sysctl -w net.ipv4.ip_forward=1 || true
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1 || true
+
+          # Maximize TCP and UDP socket buffers for 1-3 Gbps throughput
+          sudo sysctl -w net.core.rmem_max=67108864 || true
+          sudo sysctl -w net.core.wmem_max=67108864 || true
+          sudo sysctl -w net.core.rmem_default=33554432 || true
+          sudo sysctl -w net.core.wmem_default=33554432 || true
+          sudo sysctl -w net.core.netdev_max_backlog=100000 || true
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864" || true
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864" || true
+          sudo sysctl -w net.ipv4.tcp_mtu_probing=1 || true
+          sudo sysctl -w net.ipv4.tcp_fastopen=3 || true
+
+          # Detect active network interface
+          DEFAULT_IF=$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}')
+          if [ -z "$DEFAULT_IF" ]; then
+            DEFAULT_IF="eth0"
+          fi
+          echo "🌐 Default network interface: $DEFAULT_IF"
+
+          # Hardware UDP offloading for gigabit throughput
+          sudo ethtool -K "$DEFAULT_IF" rx-udp-gro-forwarding on rx-gro-list off 2>/dev/null || true
+
+          # TCP MSS clamping & NAT forwarding (prevents 4G/5G mobile packet fragmentation)
+          sudo iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+          sudo iptables -t nat -A POSTROUTING -o "$DEFAULT_IF" -j MASQUERADE 2>/dev/null || true
+
+          echo "✅ Kernel optimized with BBR, MSS Clamping, and Gigabit socket buffers."
+
+      # ───────────────────────────────────────────────
+      # Step 3: Install & Start Tailscale Gigabit Exit Node
+      # ───────────────────────────────────────────────
+      - name: 🛡️ Start Tailscale Gigabit Exit Node VPN
+        id: vpn-start
+        run: |
+          echo "⬇️ Installing Tailscale..."
+          curl -fsSL https://tailscale.com/install.sh | sh
+
+          authKey="${{ secrets.TAILSCALE_AUTH_KEY }}"
+          NODE_NAME="github-gigabit-vpn"
+          echo "TS_NODE=$NODE_NAME" >> $GITHUB_ENV
+
+          TS_AUTH_LINK=""
+
+          if [ -n "$authKey" ] && [ ${#authKey} -gt 5 ]; then
+            echo "🔐 Authenticating Tailscale with Auth Key secret..."
+            sudo tailscale up \
+              --authkey="$authKey" \
+              --advertise-exit-node \
+              --hostname="$NODE_NAME" \
+              --accept-routes \
+              --reset
+            echo "✅ Tailscale Exit Node connected successfully!"
+          else
+            echo "🔑 Secret not set. Generating 1-click authorization URL..."
+            rm -f /tmp/tailscale.log
+            sudo tailscale up --advertise-exit-node --hostname="$NODE_NAME" --reset > /tmp/tailscale.log 2>&1 &
+
+            echo "⏳ Waiting for Tailscale Auth URL..."
+            for i in {1..25}; do
+              sleep 2
+              if [ -f /tmp/tailscale.log ]; then
+                TS_AUTH_LINK=$(grep -oP 'https://tailscale\.com/a/[a-zA-Z0-9]+' /tmp/tailscale.log 2>/dev/null | head -n 1 || true)
+                if [ -n "$TS_AUTH_LINK" ]; then
+                  echo "✅ Found Tailscale Auth Link: $TS_AUTH_LINK"
+                  break
+                fi
+              fi
+            done
+          fi
+
+          # Retrieve Tailscale IP
+          tsIP=""
+          for i in {1..15}; do
+            tsIP=$(tailscale ip -4 2>/dev/null | head -n 1 || true)
+            if [ -n "$tsIP" ]; then
+              echo "✅ Tailscale IP: $tsIP"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "TS_IP=${tsIP:-100.x.x.x}" >> $GITHUB_ENV
+
+          if [ -n "$TS_AUTH_LINK" ]; then
+            echo "TS_AUTH_URL=$TS_AUTH_LINK" >> $GITHUB_ENV
+          else
+            echo "TS_AUTH_URL=Connected via Secret / Active" >> $GITHUB_ENV
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 4: Send Details to Telegram
+      # ───────────────────────────────────────────────
+      - name: 📲 Send Details to Telegram
+        run: |
+          botToken="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chatId="${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if [ -z "$botToken" ] || [ -z "$chatId" ]; then
+            echo "⚠️ Telegram secrets not set. Skipping notification."
+          else
+            message="🛡️ <b>Gigabit Private Exit Node VPN Ready!</b>"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="🚀 <b>Node:</b> <code>${TS_NODE}</code>"$'\n'
+            message+="🌐 <b>Tailscale IP:</b> <code>${TS_IP}</code>"$'\n'
+            message+="⚡ <b>Engine:</b> <code>WireGuard + BBR (1-3 Gbps)</code>"$'\n'
+            if [ "${TS_AUTH_URL}" != "Connected via Secret / Active" ]; then
+              message+="🔗 <b>Auth URL:</b> <a href=\"${TS_AUTH_URL}\">${TS_AUTH_URL}</a>"$'\n'
+            fi
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="📲 <b>How to Connect:</b>"$'\n'
+            message+="1️⃣ Open <b>Tailscale App</b> on Mobile/PC"$'\n'
+            message+="2️⃣ Tap <b>Exit Node</b> ➔ Select <b>${TS_NODE}</b>"$'\n'
+            message+="3️⃣ Browse at Gigabit speed! 🚀"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="👥 <b>Share Node with Friends (Safest):</b>"$'\n'
+            message+="1️⃣ Open <a href=\"https://login.tailscale.com/admin/machines\">Tailscale Admin Machines</a>"$'\n'
+            message+="2️⃣ Click <code>...</code> on <b>${TS_NODE}</b> ➔ <b>Share...</b>"$'\n'
+            message+="3️⃣ Send the invite link to your friends!"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⏱️ <b>Uptime:</b> ~5h 40m"$'\n'
+            message+="🔁 <b>Run:</b> #${{ github.run_number }}"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⚡ <i>Powered by Redwanul Haque</i>"
+
+            payload=$(jq -n \
+              --arg chat_id "$chatId" \
+              --arg text "$message" \
+              --arg parse_mode "HTML" \
+              '{chat_id: $chat_id, text: $text, parse_mode: $parse_mode, disable_web_page_preview: false}')
+
+            curl -s --max-time 15 -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$payload" > /dev/null || true
+            echo "✅ Telegram notification sent!"
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 5: Print Details & Keep Alive with Watchdog
+      # ───────────────────────────────────────────────
+      - name: 📢 Print Details & Keep Alive
+        run: |
+          echo ""
+          echo "================================================================="
+          echo "⚡ Powered by Redwanul Haque"
+          echo "-----------------------------------------------------------------"
+          echo "Tailscale Exit Node : ${TS_NODE}"
+          echo "Tailscale IP        : ${TS_IP}"
+          echo "Auth URL (if needed): ${TS_AUTH_URL}"
+          echo "Optimization        : Linux BBR + Socket Buffers (Gigabit)"
+          echo "================================================================="
+          echo ""
+
+          m="${{ github.event.inputs.duration || '340' }}"
+          [[ ! "$m" =~ ^[0-9]+$ ]] && m=340
+          [ "$m" -gt 345 ] && m=345
+
+          for i in $(seq 1 $m); do
+            l=$((m - i))
+            pct=$((i * 100 / m))
+            echo "[$(date +'%H:%M:%S')] ⏱️ $l min remaining ($pct% elapsed)"
+
+            # Health check Tailscale daemon
+            if ! sudo tailscale status >/dev/null 2>&1; then
+              echo "⚠️ Tailscale daemon status check warning."
+            fi
+
+            sleep 60
+          done
+
+      # ───────────────────────────────────────────────
+      # Step 6: Chain Rotation Engine
+      # ───────────────────────────────────────────────
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          inputLoops="${{ github.event.inputs.loops }}"
+          loops="${inputLoops:-4}"
+          [[ ! "$loops" =~ ^[0-9]+$ ]] && loops=4
+
+          if [ "$loops" -le 1 ]; then
+            echo "🎯 Chain Finished Successfully. Total iterations completed."
+            exit 0
+          fi
+
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is missing. Cannot dispatch next iteration."
+            exit 1
+          fi
+
+          next=$((loops - 1))
+          echo "🔁 Dispatching next iteration: $next remaining..."
+
+          payload=$(jq -n \
+            --arg ref "${{ github.ref_name }}" \
+            --arg next "$next" \
+            '{
+              ref: $ref,
+              inputs: {
+                loops: $next
+              }
+            }')
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/tailscale-gigabit-vpn.yml/dispatches" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "✅ Secured handoff executed to loop iteration: $next"
+          else
+            echo "⚠️ Chain dispatch returned HTTP status $http_code:"
+            echo "$body"
+            echo "💡 Tip: Make sure .github/workflows/tailscale-gigabit-vpn.yml is committed and pushed to your GitHub repository's default branch."
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 7: Teardown & Cleanup
+      # ───────────────────────────────────────────────
+      - name: 🧹 Tailscale Logout & Cleanup
+        if: always()
+        run: |
+          echo "🏁 Cleaning up Tailscale connection..."
+          sudo tailscale logout 2>/dev/null || true
+          sudo tailscale down 2>/dev/null || true

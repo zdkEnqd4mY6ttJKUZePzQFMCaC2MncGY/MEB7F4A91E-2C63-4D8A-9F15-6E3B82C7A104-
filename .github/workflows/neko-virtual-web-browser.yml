@@ -1,0 +1,301 @@
+name: Neko Virtual Web Browser (Ubuntu Loop) - by Redwanul Haque
+# Suggested filename: neko-virtual-web-browser.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      browser:
+        description: "🌐 Select Browser Image"
+        required: true
+        default: "chromium"
+        type: choice
+        options:
+          - "chromium"
+          - "google-chrome"
+          - "firefox"
+          - "brave"
+          - "microsoft-edge"
+          - "opera"
+          - "vivaldi"
+          - "tor-browser"
+          - "ungoogled-chromium"
+          - "waterfox"
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+
+concurrency:
+  group: neko-browser-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  neko-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      # ───────────────────────────────────────────────
+      # Step 1: Validate GitHub Token
+      # ───────────────────────────────────────────────
+      - name: 🔑 Validate GitHub Token
+        id: validate
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is not set! Go to repo Settings > Secrets > Actions and add GH_PAT."
+            exit 1
+          fi
+          echo "✅ GH_PAT secret is configured (${#token} chars)."
+
+      # ───────────────────────────────────────────────
+      # Step 2: Start Neko Container
+      # ───────────────────────────────────────────────
+      - name: 🌐 Start Neko Browser Container
+        id: neko-start
+        run: |
+          browser="${{ github.event.inputs.browser }}"
+          if [ -z "$browser" ]; then
+            browser="chromium"
+          fi
+          echo "SELECTED_BROWSER=$browser" >> $GITHUB_ENV
+
+          echo "📦 Pulling & starting ghcr.io/m1k1o/neko/$browser container on port 8080..."
+          docker run -d \
+            --name neko \
+            --restart unless-stopped \
+            --shm-size=2gb \
+            --cap-add SYS_ADMIN \
+            -p 8080:8080 \
+            -e NEKO_PASSWORD=admin \
+            -e NEKO_PASSWORD_ADMIN=admin \
+            -e NEKO_CONTROL_PROTECTION=false \
+            -e NEKO_IMPLICIT_CONTROL=true \
+            -e NEKO_LOCKS_EXPLICIT=false \
+            -e NEKO_CLIPBOARD=true \
+            -e NEKO_AUDIO=true \
+            -e NEKO_SCREEN=1280x720@60 \
+            -e NEKO_VIDEO_MAX_FPS=60 \
+            -e NEKO_VIDEO_CODEC=h264 \
+            -e NEKO_VIDEO_BITRATE=3500 \
+            -e NEKO_WEBRTC_ICE_LITE=true \
+            "ghcr.io/m1k1o/neko/$browser:latest"
+
+          echo "⏳ Waiting for Neko container on port 8080 to become ready..."
+          ready=false
+          for i in {1..20}; do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:8080 | grep -q "200\|302\|401"; then
+              ready=true
+              echo "✅ Neko ($browser) server is active and responding on port 8080 (attempt $i)!"
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "$ready" = "true" ] || [ "$(docker inspect -f '{{.State.Running}}' neko 2>/dev/null || true)" == "true" ]; then
+            echo "🔓 Unblocking Downloads & configuring browser policies..."
+            docker exec -u 0 neko bash -c '
+              # 1. Remove any restrictive default policy files
+              rm -rf /etc/chromium/policies/managed/* /etc/opt/chrome/policies/managed/* /etc/google-chrome/policies/managed/* /etc/brave/policies/managed/* /etc/opt/edge/policies/managed/* /etc/opera/policies/managed/* /etc/vivaldi/policies/managed/* 2>/dev/null || true
+
+              # 2. Create proper policy directories
+              mkdir -p /etc/chromium/policies/managed /etc/opt/chrome/policies/managed /etc/google-chrome/policies/managed /etc/brave/policies/managed /etc/opt/edge/policies/managed /etc/opera/policies/managed /etc/vivaldi/policies/managed /etc/firefox/policies /usr/lib/firefox/distribution /usr/lib/waterfox/distribution /usr/lib/tor-browser/distribution 2>/dev/null || true
+
+              # 3. Write unrestricted policy allowing all downloads, file dialogs, and dev tools
+              policy="{\"DownloadRestrictions\": 0, \"AllowFileSelectionDialogs\": true, \"DeveloperToolsAvailability\": 1, \"DeveloperToolsDisabled\": false, \"DownloadDirectory\": \"/home/neko/Downloads\", \"PromptForDownloadLocation\": false, \"SafeBrowsingProtectionLevel\": 0, \"ExternalProtocolDialogCheckable\": true, \"URLBlocklist\": [], \"URLAllowlist\": [\"*\"]}"
+              echo "$policy" > /etc/chromium/policies/managed/unrestricted.json 2>/dev/null || true
+              echo "$policy" > /etc/opt/chrome/policies/managed/unrestricted.json 2>/dev/null || true
+              echo "$policy" > /etc/google-chrome/policies/managed/unrestricted.json 2>/dev/null || true
+              echo "$policy" > /etc/brave/policies/managed/unrestricted.json 2>/dev/null || true
+              echo "$policy" > /etc/opt/edge/policies/managed/unrestricted.json 2>/dev/null || true
+              echo "$policy" > /etc/opera/policies/managed/unrestricted.json 2>/dev/null || true
+              echo "$policy" > /etc/vivaldi/policies/managed/unrestricted.json 2>/dev/null || true
+
+              # 4. Firefox-family policy
+              ff_policy="{\"policies\": {\"DisableDeveloperTools\": false, \"DisableAppUpdate\": true, \"Preferences\": {\"browser.download.dir\": {\"Value\": \"/home/neko/Downloads\", \"Status\": \"locked\"}, \"browser.download.folderList\": {\"Value\": 2, \"Status\": \"locked\"}, \"browser.download.useDownloadDir\": {\"Value\": true, \"Status\": \"locked\"}}}}"
+              echo "$ff_policy" > /etc/firefox/policies/policies.json 2>/dev/null || true
+              echo "$ff_policy" > /usr/lib/firefox/distribution/policies.json 2>/dev/null || true
+              echo "$ff_policy" > /usr/lib/waterfox/distribution/policies.json 2>/dev/null || true
+              echo "$ff_policy" > /usr/lib/tor-browser/distribution/policies.json 2>/dev/null || true
+
+              # 5. Fix permissions for downloads
+              mkdir -p /home/neko/Downloads /home/neko/Desktop /downloads /tmp 2>/dev/null || true
+              chown -R neko:neko /home/neko /downloads 2>/dev/null || true
+              chmod -R 777 /home/neko/Downloads /home/neko/Desktop /downloads /tmp 2>/dev/null || true
+            ' || true
+            echo "✅ Policies applied and download permissions configured."
+          else
+            echo "❌ Neko container failed to start. Container logs:"
+            docker logs neko || true
+            exit 1
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 3: Install & Start Cloudflare Tunnel
+      # ───────────────────────────────────────────────
+      - name: 🌐 Setup Cloudflare Tunnel
+        id: cloudflare-tunnel
+        run: |
+          echo "⬇️ Downloading & installing cloudflared..."
+          curl -L -s --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          rm -f cloudflared.deb
+
+          echo "🚀 Launching Cloudflare Tunnel for http://localhost:8080 ..."
+          rm -f /tmp/cloudflared.log
+          cloudflared tunnel --protocol http2 --url http://localhost:8080 --logfile /tmp/cloudflared.log > /dev/null 2>&1 &
+
+          echo "⏳ Waiting for Cloudflare Tunnel URL..."
+          CF_URL=""
+          for i in {1..30}; do
+            sleep 2
+            if [ -f /tmp/cloudflared.log ]; then
+              CF_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$CF_URL" ]; then
+                echo "✅ Found Cloudflare URL on attempt $i: $CF_URL"
+                break
+              fi
+            fi
+          done
+
+          if [ -n "$CF_URL" ]; then
+            echo ""
+            echo "================================================================="
+            echo "🌐 NEKO WEB BROWSER URL: $CF_URL"
+            echo "================================================================="
+            echo ""
+            echo "NEKO_URL=$CF_URL" >> $GITHUB_ENV
+          else
+            echo "⚠️ Cloudflare Tunnel URL could not be extracted within time limit."
+            if [ -f /tmp/cloudflared.log ]; then
+              echo "--- Cloudflare Log Content ---"
+              cat /tmp/cloudflared.log || true
+            fi
+            echo "NEKO_URL=Not Available" >> $GITHUB_ENV
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 4: Send Credentials via Telegram
+      # ───────────────────────────────────────────────
+      - name: 📲 Send Details to Telegram
+        run: |
+          botToken="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chatId="${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if [ -z "$botToken" ] || [ -z "$chatId" ]; then
+            echo "⚠️ Telegram secrets not set. Skipping notification."
+          else
+            message="🌐 <b>Neko Virtual Web Browser Ready (${SELECTED_BROWSER})!</b>"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="🔗 Web Browser URL: <code>${NEKO_URL}</code>"$'\n'
+            message+="🌐 Browser Engine: <code>${SELECTED_BROWSER}</code>"$'\n'
+            message+="👤 User Password: <code>admin</code>"$'\n'
+            message+="🔑 Admin Password: <code>admin</code>"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="💡 <b>Zero Mouse Lag:</b> In settings ⚙️, turn ON <i>'Ignore server-side cursor'</i>"$'\n'
+            message+="📋 <b>Copy/Paste Tip:</b> Use HTTPS URL or Neko side-menu 📋 Clipboard panel"$'\n'
+            message+="📥 <b>Downloads:</b> Fully Unblocked to <code>/home/neko/Downloads</code>"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⏱️ Uptime: ~5h 50m"$'\n'
+            message+="🔁 Run: #${{ github.run_number }}"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⚡ <i>Powered by Redwanul Haque</i>"
+
+            payload=$(jq -n \
+              --arg chat_id "$chatId" \
+              --arg text "$message" \
+              --arg parse_mode "HTML" \
+              '{chat_id: $chat_id, text: $text, parse_mode: $parse_mode}')
+
+            curl -s -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$payload" > /dev/null || true
+            echo "✅ Telegram notification sent!"
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 5: Print Details & Keep Alive
+      # ───────────────────────────────────────────────
+      - name: 📢 Print Details & Keep Alive
+        run: |
+          echo ""
+          echo "================================================================="
+          echo "⚡ Powered by Redwanul Haque"
+          echo "-----------------------------------------------------------------"
+          echo "Browser Engine  : ${SELECTED_BROWSER}"
+          echo "Neko Browser URL: ${NEKO_URL}"
+          echo "User Password   : admin"
+          echo "Admin Password  : admin"
+          echo "Zero Mouse Lag  : In Web Settings ⚙️ -> Turn ON 'Ignore server-side cursor'"
+          echo "Copy / Paste    : Use HTTPS or click Neko side menu 📋 Clipboard panel"
+          echo "Downloads       : Unblocked & saved to /home/neko/Downloads"
+          echo "================================================================="
+          echo ""
+
+          m=350
+          for i in $(seq 1 $m); do
+            l=$((m - i))
+            pct=$((i * 100 / m))
+            echo "[$(date +'%H:%M:%S')] ⏱️ $l min remaining ($pct% elapsed)"
+            sleep 60
+          done
+
+      # ───────────────────────────────────────────────
+      # Step 6: Chain Rotation Engine
+      # ───────────────────────────────────────────────
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          inputLoops="${{ github.event.inputs.loops }}"
+          if [ -z "$inputLoops" ]; then
+            loops=4
+          else
+            loops=$inputLoops
+          fi
+
+          if [ "$loops" -le 1 ]; then
+            echo "🎯 Chain Finished Successfully. Total iterations completed."
+            exit 0
+          fi
+
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is missing. Cannot dispatch next iteration."
+            exit 1
+          fi
+
+          next=$((loops - 1))
+          browser="${SELECTED_BROWSER:-chromium}"
+          echo "🔁 Dispatching next iteration ($browser): $next remaining..."
+
+          payload=$(jq -n \
+            --arg ref "${{ github.ref_name }}" \
+            --arg browser "$browser" \
+            --arg next "$next" \
+            '{ref: $ref, inputs: {browser: $browser, loops: $next}}')
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/neko-virtual-web-browser.yml/dispatches" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "✅ Secured handoff executed to loop iteration: $next"
+          else
+            echo "⚠️ Chain dispatch returned HTTP status $http_code:"
+            echo "$body"
+            echo "💡 Tip: Make sure .github/workflows/neko-virtual-web-browser.yml is committed and pushed to your GitHub repository's default branch."
+          fi

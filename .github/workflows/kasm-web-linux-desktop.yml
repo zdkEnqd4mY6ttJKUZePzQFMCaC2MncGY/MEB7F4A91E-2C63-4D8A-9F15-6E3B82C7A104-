@@ -1,0 +1,335 @@
+name: Kasm Web Linux Desktop (Ubuntu Loop) - by Redwanul Haque
+# Suggested filename: kasm-web-linux-desktop.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "🖥️ Select Desktop Image"
+        required: false
+        default: "kasmweb/desktop:1.15.0"
+        type: choice
+        options:
+          - "kasmweb/desktop:1.15.0"
+          - "kasmweb/ubuntu-jammy-desktop:1.15.0"
+          - "kasmweb/chrome:1.15.0"
+          - "kasmweb/firefox:1.15.0"
+          - "kasmweb/kali-rolling-desktop:1.15.0"
+      resolution:
+        description: "🖥️ Screen Resolution"
+        required: false
+        default: "1920x1080"
+        type: choice
+        options:
+          - "1920x1080"
+          - "2560x1440"
+          - "1366x768"
+          - "1280x720"
+      duration:
+        description: "⏱️ Runtime in minutes (max 345)"
+        required: false
+        default: "340"
+      vnc_password:
+        description: "🔑 Custom Password (leave blank for 'password')"
+        required: false
+        default: "password"
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+
+concurrency:
+  group: kasm-desktop-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  kasm-desktop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ───────────────────────────────────────────────
+      # Step 1: Validate GitHub Token
+      # ───────────────────────────────────────────────
+      - name: 🔑 Validate GitHub Token
+        id: validate
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is not set! Go to repo Settings > Secrets > Actions and add GH_PAT."
+            exit 1
+          fi
+          echo "✅ GH_PAT secret is configured (${#token} chars)."
+
+      # ───────────────────────────────────────────────
+      # Step 2: System Specs & Pre-flight
+      # ───────────────────────────────────────────────
+      - name: 🧠 System Information
+        run: |
+          echo "=============================================="
+          echo "🖥️ GitHub Actions Runner Specs"
+          echo "=============================================="
+          echo "CPU Cores : $(nproc)"
+          echo "RAM       : $(free -h | awk '/^Mem:/ {print $2}')"
+          echo "Disk Free : $(df -h / | awk 'NR==2 {print $4}')"
+          echo "Docker    : $(docker --version)"
+          echo "=============================================="
+
+      # ───────────────────────────────────────────────
+      # Step 3: Start Optimized Kasm Desktop Container
+      # ───────────────────────────────────────────────
+      - name: 🖥️ Start Kasm Linux Desktop Container
+        id: kasm-start
+        run: |
+          IMAGE="${{ github.event.inputs.image || 'kasmweb/desktop:1.15.0' }}"
+          RES="${{ github.event.inputs.resolution || '1920x1080' }}"
+          PASS="${{ github.event.inputs.vnc_password || 'password' }}"
+          [ -z "$PASS" ] && PASS="password"
+
+          echo "KASM_IMAGE=$IMAGE" >> $GITHUB_ENV
+          echo "KASM_RES=$RES" >> $GITHUB_ENV
+          echo "KASM_PASS=$PASS" >> $GITHUB_ENV
+
+          echo "📦 Pulling & starting $IMAGE ($RES)..."
+          docker run -d \
+            --name kasm-desktop \
+            --shm-size=4gb \
+            --memory=7g \
+            --cpus=2 \
+            --ulimit nofile=65535:65535 \
+            -p 6901:6901 \
+            -e VNC_PW="$PASS" \
+            -e VNC_RESOLUTION="$RES" \
+            -e VNC_COL_DEPTH=24 \
+            -e MAX_FRAME_RATE=30 \
+            -e VNCOPTIONS="-PreferBandwidth -DynamicQualityMin=6 -DynamicQualityMax=9 -DLP_ClipDelay=0" \
+            -e KASMVNC_AUTO_RECOVER=true \
+            -e START_XFCE4=1 \
+            "$IMAGE"
+
+          echo "⏳ Waiting for Kasm Desktop container to initialize and respond..."
+          ready=false
+          for i in {1..40}; do
+            if docker inspect -f '{{.State.Running}}' kasm-desktop 2>/dev/null | grep -q true; then
+              if curl -k -s --max-time 2 https://localhost:6901/ >/dev/null 2>&1; then
+                ready=true
+                echo "✅ Kasm Desktop is up and responding on port 6901 (attempt $i)!"
+                break
+              fi
+            fi
+            sleep 2
+          done
+
+          if [ "$ready" != "true" ]; then
+            echo "❌ Kasm Desktop failed to start properly. Container logs:"
+            docker logs --tail 50 kasm-desktop || true
+            exit 1
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 4: Install & Start Cloudflare Tunnel
+      # ───────────────────────────────────────────────
+      - name: 🌐 Setup Cloudflare Tunnel
+        id: cloudflare-tunnel
+        run: |
+          echo "⬇️ Downloading cloudflared standalone binary..."
+          sudo curl -fsSL --retry 3 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -o /usr/local/bin/cloudflared
+          sudo chmod +x /usr/local/bin/cloudflared
+
+          echo "🚀 Launching Cloudflare Tunnel for https://localhost:6901 ..."
+          rm -f /tmp/cloudflared.log
+          nohup /usr/local/bin/cloudflared tunnel --url https://localhost:6901 --no-tls-verify --protocol auto --logfile /tmp/cloudflared.log > /dev/null 2>&1 &
+          CF_PID=$!
+          echo "CLOUDFLARED_PID=$CF_PID" >> $GITHUB_ENV
+          echo "☁️ Cloudflare process started (PID: $CF_PID)"
+
+          echo "⏳ Waiting for Cloudflare Tunnel URL..."
+          CF_URL=""
+          for i in {1..30}; do
+            sleep 2
+            if [ -f /tmp/cloudflared.log ]; then
+              CF_URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$CF_URL" ]; then
+                echo "✅ Found Cloudflare URL on attempt $i: $CF_URL"
+                break
+              fi
+            fi
+          done
+
+          if [ -n "$CF_URL" ]; then
+            echo ""
+            echo "================================================================="
+            echo "🖥️ KASM DESKTOP URL: $CF_URL"
+            echo "================================================================="
+            echo ""
+            echo "KASM_URL=$CF_URL" >> $GITHUB_ENV
+          else
+            echo "❌ Cloudflare Tunnel URL could not be extracted."
+            if [ -f /tmp/cloudflared.log ]; then
+              cat /tmp/cloudflared.log || true
+            fi
+            exit 1
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 5: Send Details to Telegram
+      # ───────────────────────────────────────────────
+      - name: 📲 Send Details to Telegram
+        run: |
+          botToken="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chatId="${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if [ -z "$botToken" ] || [ -z "$chatId" ]; then
+            echo "⚠️ Telegram secrets not configured. Skipping notification."
+          else
+            message="🖥️ <b>Kasm Linux Desktop Ready!</b>"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="🔗 <b>URL:</b> <a href=\"${KASM_URL}\">${KASM_URL}</a>"$'\n'
+            message+="👤 <b>Username:</b> <code>kasm_user</code>"$'\n'
+            message+="🔑 <b>Password:</b> <code>${KASM_PASS}</code>"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="🖥️ <b>Resolution:</b> <code>${KASM_RES}</code>"$'\n'
+            message+="📦 <b>Image:</b> <code>${KASM_IMAGE}</code>"$'\n'
+            message+="⏱️ <b>Uptime:</b> ~5h 40m"$'\n'
+            message+="🔁 <b>Run:</b> #${{ github.run_number }}"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⚡ <i>Powered by Redwanul Haque</i>"
+
+            payload=$(jq -n \
+              --arg chat_id "$chatId" \
+              --arg text "$message" \
+              --arg parse_mode "HTML" \
+              '{chat_id: $chat_id, text: $text, parse_mode: $parse_mode, disable_web_page_preview: false}')
+
+            curl -s --max-time 15 -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$payload" > /dev/null || true
+            echo "✅ Telegram notification sent!"
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 6: Print Details & Keep Alive with Watchdog
+      # ───────────────────────────────────────────────
+      - name: 📢 Print Details & Keep Alive
+        run: |
+          echo ""
+          echo "================================================================="
+          echo "⚡ Powered by Redwanul Haque"
+          echo "-----------------------------------------------------------------"
+          echo "Kasm Desktop URL : ${KASM_URL}"
+          echo "Username         : kasm_user"
+          echo "Password         : ${KASM_PASS}"
+          echo "Resolution       : ${KASM_RES}"
+          echo "Image            : ${KASM_IMAGE}"
+          echo "================================================================="
+          echo ""
+
+          m="${{ github.event.inputs.duration || '340' }}"
+          [[ ! "$m" =~ ^[0-9]+$ ]] && m=340
+          [ "$m" -gt 345 ] && m=345
+
+          for i in $(seq 1 $m); do
+            l=$((m - i))
+            pct=$((i * 100 / m))
+            echo "[$(date +'%H:%M:%S')] ⏱️ $l min remaining ($pct% elapsed)"
+
+            # Health check Kasm container
+            if ! docker inspect -f '{{.State.Running}}' kasm-desktop 2>/dev/null | grep -q true; then
+              echo "❌ Kasm container stopped unexpectedly!"
+              docker logs --tail 50 kasm-desktop || true
+              exit 1
+            fi
+
+            # Health check Cloudflare tunnel
+            if [ -n "${CLOUDFLARED_PID:-}" ] && ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
+              echo "⚠️ Cloudflare tunnel process died. Exiting keep-alive..."
+              tail -n 30 /tmp/cloudflared.log || true
+              exit 1
+            fi
+
+            sleep 60
+          done
+
+      # ───────────────────────────────────────────────
+      # Step 7: Chain Rotation Engine
+      # ───────────────────────────────────────────────
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          inputLoops="${{ github.event.inputs.loops }}"
+          if [ -z "$inputLoops" ]; then
+            loops=4
+          else
+            loops=$inputLoops
+          fi
+
+          if ! [[ "$loops" =~ ^[0-9]+$ ]]; then
+            loops=4
+          fi
+
+          if [ "$loops" -le 1 ]; then
+            echo "🎯 Chain Finished Successfully. Total iterations completed."
+            exit 0
+          fi
+
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is missing. Cannot dispatch next iteration."
+            exit 1
+          fi
+
+          next=$((loops - 1))
+          echo "🔁 Dispatching next iteration: $next remaining..."
+
+          payload=$(jq -n \
+            --arg ref "${{ github.ref_name }}" \
+            --arg image "${{ env.KASM_IMAGE }}" \
+            --arg res "${{ env.KASM_RES }}" \
+            --arg pass "${{ env.KASM_PASS }}" \
+            --arg next "$next" \
+            '{
+              ref: $ref,
+              inputs: {
+                image: $image,
+                resolution: $res,
+                vnc_password: $pass,
+                loops: $next
+              }
+            }')
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/kasm-web-linux-desktop.yml/dispatches" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "✅ Secured handoff executed to loop iteration: $next"
+          else
+            echo "⚠️ Chain dispatch returned HTTP status $http_code:"
+            echo "$body"
+            echo "💡 Tip: Make sure .github/workflows/kasm-web-linux-desktop.yml is committed and pushed to your GitHub repository's default branch."
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 8: Diagnostics & Cleanup
+      # ───────────────────────────────────────────────
+      - name: 🧾 Final Diagnostics & Cleanup
+        if: always()
+        run: |
+          echo "🏁 Job finished at $(date -u)"
+          docker stop kasm-desktop 2>/dev/null || true
+          docker rm -f kasm-desktop 2>/dev/null || true

@@ -1,4 +1,5 @@
 name: MediaCrawler & Cloudflare Tunnel (Windows RDP Loop) - by Redwanul Haque
+# Suggested filename: mediacrawler-cloudflare-tunnel.yml
 
 on:
   workflow_dispatch:
@@ -200,7 +201,29 @@ jobs:
       # ───────────────────────────────────────────────
       - name: 🚀 Setup MediaCrawler & Cloudflare Tunnel
         id: mediacrawler-cf
+        env:
+          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_MEDIACRAWLER }}
+          MEDIACRAWLER_URL: ${{ vars.MEDIACRAWLER_URL }}
         run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:CLOUDFLARE_TUNNEL_TOKEN)) {
+              throw "CLOUDFLARE_TUNNEL_TOKEN_MEDIACRAWLER secret is not configured."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:MEDIACRAWLER_URL)) {
+              throw "MEDIACRAWLER_URL repository variable is not configured."
+          }
+
+          try {
+              $permanentUrl = [Uri]$env:MEDIACRAWLER_URL
+          } catch {
+              throw "MEDIACRAWLER_URL must be a valid HTTPS URL."
+          }
+          if ($permanentUrl.Scheme -ne "https" -or -not $permanentUrl.Host) {
+              throw "MEDIACRAWLER_URL must be a valid HTTPS URL."
+          }
+          $cfUrlResult = $permanentUrl.AbsoluteUri.TrimEnd("/")
+
           # 1. Download & Extract MediaCrawler
           $zipUrl = "https://pub-9ac4fabf50b043d189908267ca0d8599.r2.dev/YT-DLP/MediaCrawler/Updated/mediacrawler.zip"
           $zipPath = "$env:TEMP\mediacrawler.zip"
@@ -255,7 +278,7 @@ jobs:
               }
           }
 
-          # 3. Download & Setup Cloudflare Tunnel directly (Reliable & Fast)
+          # 3. Download the Cloudflare Tunnel connector
           Write-Host "🌐 Setting up Cloudflare Tunnel CLI (cloudflared)..."
           $cfBinDir = "$env:ProgramData\cloudflared"
           $cfExe = "$cfBinDir\cloudflared.exe"
@@ -266,41 +289,50 @@ jobs:
           }
           Write-Host "✅ cloudflared binary ready at: $cfExe"
 
-          # 4. Start Cloudflare Tunnel pointing to http://localhost:8000
+          # 4. Start the remotely managed named tunnel
           $cfLog = "$env:TEMP\cloudflared.log"
           if (Test-Path $cfLog) { Remove-Item $cfLog -Force }
 
-          Write-Host "🚀 Launching cloudflared tunnel --url http://localhost:8000 ..."
-          Start-Process -FilePath $cfExe -ArgumentList "tunnel", "--url", "http://localhost:8000", "--logfile", "`"$cfLog`"" -WindowStyle Hidden
+          Write-Host "🚀 Connecting named tunnel for $cfUrlResult ..."
+          $cfArguments = @(
+              "tunnel",
+              "--no-autoupdate",
+              "--logfile", $cfLog,
+              "run",
+              "--token", $env:CLOUDFLARE_TUNNEL_TOKEN
+          )
+          $cfProcess = Start-Process -FilePath $cfExe -ArgumentList $cfArguments -WindowStyle Hidden -PassThru
 
-          # 5. Extract *.trycloudflare.com URL from log with retry loop
-          $cfUrlResult = $null
-          $retries = 0
-          while (-not $cfUrlResult -and $retries -lt 30) {
+          # 5. Verify that the connector registers with Cloudflare
+          $tunnelReady = $false
+          for ($i = 1; $i -le 30; $i++) {
               Start-Sleep -Seconds 2
+              if ($cfProcess.HasExited) {
+                  break
+              }
               if (Test-Path $cfLog) {
                   $logContent = Get-Content -Path $cfLog -Raw -ErrorAction SilentlyContinue
-                  if ($logContent -match '(https://[a-zA-Z0-9-]+\.trycloudflare\.com)') {
-                      $cfUrlResult = $matches[1]
+                  if ($logContent -match 'Registered tunnel connection') {
+                      $tunnelReady = $true
+                      break
                   }
               }
-              $retries++
           }
 
-          if ($cfUrlResult) {
-              Write-Host ""
-              Write-Host "================================================================="
-              Write-Host "🌐 CLOUDFLARE TUNNEL URL: $cfUrlResult"
-              Write-Host "================================================================="
-              Write-Host ""
-              "CF_TUNNEL_URL=$cfUrlResult" | Out-File -Append $env:GITHUB_ENV
-          } else {
-              Write-Host "⚠️ Cloudflare Tunnel URL could not be extracted within time limit."
+          if (-not $tunnelReady) {
+              Write-Host "❌ Named Cloudflare Tunnel failed to connect."
               if (Test-Path $cfLog) {
-                  Get-Content -Path $cfLog -Tail 15 -ErrorAction SilentlyContinue | Write-Host
+                  Get-Content -Path $cfLog -Tail 30 -ErrorAction SilentlyContinue | Write-Host
               }
-              "CF_TUNNEL_URL=Not Available" | Out-File -Append $env:GITHUB_ENV
+              exit 1
           }
+
+          Write-Host ""
+          Write-Host "================================================================="
+          Write-Host "🌐 PERMANENT MEDIACRAWLER URL: $cfUrlResult"
+          Write-Host "================================================================="
+          Write-Host ""
+          "CF_TUNNEL_URL=$cfUrlResult" | Out-File -Append $env:GITHUB_ENV
 
       # ───────────────────────────────────────────────
       # Step 6: Send Credentials via Telegram

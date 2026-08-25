@@ -203,7 +203,7 @@ jobs:
         id: mediacrawler-cf
         env:
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN_MEDIACRAWLER }}
-          MEDIACRAWLER_URL: ${{ vars.MEDIACRAWLER_URL }}
+          MEDIACRAWLER_URL: ${{ secrets.MEDIACRAWLER_URL }}
         run: |
           $ErrorActionPreference = "Stop"
 

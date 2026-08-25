@@ -1,4 +1,4 @@
-name: WireGuard / Tailscale Gigabit VPN (Ubuntu Loop) - by Redwanul Haque
+name: Tailscale Gigabit VPN (Ubuntu Loop) - by Redwanul Haque
 # Suggested filename: tailscale-gigabit-vpn.yml
 
 on:

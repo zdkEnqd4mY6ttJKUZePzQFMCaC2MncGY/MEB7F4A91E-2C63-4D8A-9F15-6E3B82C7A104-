@@ -46,12 +46,11 @@ jobs:
         id: install-coolify
         run: |
           echo "📦 Starting official Coolify installation script..."
-          # Running the standard unattended installer
-          curl -fsSL https://cdn.coollabs.io/coolify/install.sh | sudo bash -s -- --do-not-track
+          curl -fsSL https://cdn.coollabs.io/coolify/install.sh | sudo bash
 
           echo "⏳ Waiting for Coolify web server on port 8000 to become ready..."
           ready=false
-          for i in {1..30}; do
+          for i in {1..40}; do
             if curl -s -o /dev/null -w "%{http_code}" http://localhost:8000 | grep -q "200\|302\|401"; then
               ready=true
               echo "✅ Coolify dashboard is active and responding on port 8000 (attempt $i)!"
@@ -217,4 +216,3 @@ jobs:
             echo "$body"
             echo "💡 Tip: Ensure .github/workflows/coolify-runner.yml is committed and pushed to your default branch."
           fi
-          

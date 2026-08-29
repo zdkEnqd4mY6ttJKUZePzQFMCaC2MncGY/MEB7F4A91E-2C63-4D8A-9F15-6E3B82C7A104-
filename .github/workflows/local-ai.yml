@@ -1,0 +1,262 @@
+name: Local AI OpenAI-Compatible Hub - by Redwanul Haque
+# Suggested filename: .github/workflows/local-ai.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "🧠 Select Default Model to Pull"
+        required: true
+        default: "llama3.2:1b"
+        type: choice
+        options:
+          - "llama3.2:1b"
+          - "llama3.2:3b"
+          - "qwen2.5:1.5b"
+          - "qwen2.5-coder:1.5b"
+          - "gemma2:2b"
+          - "phi3:mini"
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+
+concurrency:
+  group: local-ai-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  local-ai-hub:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      # ───────────────────────────────────────────────
+      # Step 1: Validate GitHub Token
+      # ───────────────────────────────────────────────
+      - name: 🔑 Validate GitHub Token
+        id: validate
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is not set! Go to repo Settings > Secrets > Actions and add GH_PAT."
+            exit 1
+          fi
+          echo "✅ GH_PAT secret is configured (${#token} chars)."
+
+      # ───────────────────────────────────────────────
+      # Step 2: Start Ollama & Pull Selected Model
+      # ───────────────────────────────────────────────
+      - name: 🧠 Start Ollama & Download Model
+        id: start-ollama
+        run: |
+          selected_model="${{ github.event.inputs.model }}"
+          if [ -z "$selected_model" ]; then
+            selected_model="llama3.2:1b"
+          fi
+          echo "SELECTED_MODEL=$selected_model" >> $GITHUB_ENV
+
+          echo "📦 Starting Ollama container on port 11434..."
+          docker run -d \
+            --name ollama \
+            --restart unless-stopped \
+            -p 11434:11434 \
+            -v /home/runner/ollama:/root/.ollama \
+            ollama/ollama:latest
+
+          echo "⏳ Waiting for Ollama engine to start..."
+          for i in {1..20}; do
+            if curl -s http://localhost:11434/api/tags > /dev/null; then
+              echo "✅ Ollama is up and healthy!"
+              break
+            fi
+            sleep 2
+          done
+
+          echo "⬇️ Pulling model: $selected_model (this may take 1-2 minutes)..."
+          docker exec ollama ollama pull "$selected_model"
+
+      # ───────────────────────────────────────────────
+      # Step 3: Start Open WebUI (ChatGPT Clone Interface)
+      # ───────────────────────────────────────────────
+      - name: 💬 Start Open WebUI Interface
+        id: start-webui
+        run: |
+          echo "📦 Starting Open WebUI connected to Ollama..."
+          docker run -d \
+            --name open-webui \
+            --restart unless-stopped \
+            --network host \
+            -e OLLAMA_BASE_URL=http://127.0.0.1:11434 \
+            -e WEBUI_AUTH=False \
+            ghcr.io/open-webui/open-webui:main
+
+          echo "⏳ Waiting for Open WebUI on port 8080..."
+          ready=false
+          for i in {1..30}; do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:8080 | grep -q "200\|302"; then
+              ready=true
+              echo "✅ Open WebUI is ready on port 8080 (attempt $i)!"
+              break
+            fi
+            sleep 3
+          done
+
+      # ───────────────────────────────────────────────
+      # Step 4: Install & Start Cloudflare Tunnel
+      # ───────────────────────────────────────────────
+      - name: 🌐 Setup Cloudflare Tunnel
+        id: cloudflare-tunnel
+        run: |
+          echo "⬇️ Downloading & installing cloudflared..."
+          curl -L -s --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          rm -f cloudflared.deb
+
+          echo "🚀 Launching Cloudflare Tunnel for http://localhost:8080 ..."
+          rm -f /tmp/cloudflared.log
+          cloudflared tunnel --protocol http2 --url http://localhost:8080 --logfile /tmp/cloudflared.log > /dev/null 2>&1 &
+
+          echo "⏳ Waiting for Cloudflare Tunnel URL..."
+          CF_URL=""
+          for i in {1..30}; do
+            sleep 2
+            if [ -f /tmp/cloudflared.log ]; then
+              CF_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$CF_URL" ]; then
+                echo "✅ Found Cloudflare URL on attempt $i: $CF_URL"
+                break
+              fi
+            fi
+          done
+
+          if [ -n "$CF_URL" ]; then
+            echo ""
+            echo "================================================================="
+            echo "🌐 AI WEB CHAT URL : $CF_URL"
+            echo "🔗 OPENAI API BASE : $CF_URL/api/v1 (or via port 11434)"
+            echo "================================================================="
+            echo ""
+            echo "AI_URL=$CF_URL" >> $GITHUB_ENV
+          else
+            echo "AI_URL=Not Available" >> $GITHUB_ENV
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 5: Send Details via Telegram
+      # ───────────────────────────────────────────────
+      - name: 📲 Send Details to Telegram
+        run: |
+          botToken="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chatId="${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if [ -z "$botToken" ] || [ -z "$chatId" ]; then
+            echo "⚠️ Telegram secrets not set. Skipping notification."
+          else
+            message="🧠 <b>OpenAI-Compatible Local AI Ready!</b>"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="🌐 <b>Chat WebUI:</b> <code>${AI_URL}</code>"$'\n'
+            message+="🤖 <b>Active Model:</b> <code>${SELECTED_MODEL}</code>"$'\n'
+            message+="🔌 <b>OpenAI API Path:</b> <code>${AI_URL}/api/v1</code>"$'\n'
+            message+="🔑 <b>API Key:</b> Any random string (e.g., <code>ollama</code>)"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⏱️ <b>Uptime:</b> ~5h 50m"$'\n'
+            message+="🔁 <b>Run:</b> #${{ github.run_number }}"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⚡ <i>Powered by Redwanul Haque</i>"
+
+            payload=$(jq -n \
+              --arg chat_id "$chatId" \
+              --arg text "$message" \
+              --arg parse_mode "HTML" \
+              '{chat_id: $chat_id, text: $text, parse_mode: $parse_mode}')
+
+            curl -s -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$payload" > /dev/null || true
+            echo "✅ Telegram notification sent!"
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 6: Print Details & Keep Alive
+      # ───────────────────────────────────────────────
+      - name: 📢 Print Details & Keep Alive
+        run: |
+          echo ""
+          echo "================================================================="
+          echo "⚡ Powered by Redwanul Haque"
+          echo "-----------------------------------------------------------------"
+          echo "WebUI URL       : ${AI_URL}"
+          echo "Selected Model  : ${SELECTED_MODEL}"
+          echo "OpenAI Endpoint : ${AI_URL}/api/v1/chat/completions"
+          echo "================================================================="
+          echo ""
+
+          m=350
+          for i in $(seq 1 $m); do
+            l=$((m - i))
+            pct=$((i * 100 / m))
+            echo "[$(date +'%H:%M:%S')] ⏱️ $l min remaining ($pct% elapsed)"
+            sleep 60
+          done
+
+      # ───────────────────────────────────────────────
+      # Step 7: Chain Rotation Engine
+      # ───────────────────────────────────────────────
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          inputLoops="${{ github.event.inputs.loops }}"
+          if [ -z "$inputLoops" ]; then
+            loops=4
+          else
+            loops=$inputLoops
+          fi
+
+          if [ "$loops" -le 1 ]; then
+            echo "🎯 Chain Finished Successfully. Total iterations completed."
+            exit 0
+          fi
+
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is missing. Cannot dispatch next iteration."
+            exit 1
+          fi
+
+          next=$((loops - 1))
+          model="${SELECTED_MODEL:-llama3.2:1b}"
+          echo "🔁 Dispatching next iteration ($model): $next remaining..."
+
+          payload=$(jq -n \
+            --arg ref "${{ github.ref_name }}" \
+            --arg model "$model" \
+            --arg next "$next" \
+            '{ref: $ref, inputs: {model: $model, loops: $next}}')
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/local-ai.yml/dispatches" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "✅ Secured handoff executed to loop iteration: $next"
+          else
+            echo "⚠️ Chain dispatch returned HTTP status $http_code:"
+            echo "$body"
+            echo "💡 Tip: Ensure .github/workflows/local-ai.yml is committed and pushed to your default branch."
+          fi
+          

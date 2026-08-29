@@ -1,0 +1,220 @@
+name: Coolify Self-Hosted Runner - by Redwanul Haque
+# Suggested filename: .github/workflows/coolify-runner.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+
+concurrency:
+  group: coolify-runner-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  coolify-instance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      # ───────────────────────────────────────────────
+      # Step 1: Validate GitHub Token
+      # ───────────────────────────────────────────────
+      - name: 🔑 Validate GitHub Token
+        id: validate
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is not set! Go to repo Settings > Secrets > Actions and add GH_PAT."
+            exit 1
+          fi
+          echo "✅ GH_PAT secret is configured (${#token} chars)."
+
+      # ───────────────────────────────────────────────
+      # Step 2: Install & Start Coolify
+      # ───────────────────────────────────────────────
+      - name: 🚀 Install & Start Coolify
+        id: install-coolify
+        run: |
+          echo "📦 Starting official Coolify installation script..."
+          # Running the standard unattended installer
+          curl -fsSL https://cdn.coollabs.io/coolify/install.sh | sudo bash -s -- --do-not-track
+
+          echo "⏳ Waiting for Coolify web server on port 8000 to become ready..."
+          ready=false
+          for i in {1..30}; do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:8000 | grep -q "200\|302\|401"; then
+              ready=true
+              echo "✅ Coolify dashboard is active and responding on port 8000 (attempt $i)!"
+              break
+            fi
+            sleep 3
+          done
+
+          if [ "$ready" != "true" ]; then
+            echo "❌ Coolify failed to respond in time. Checking Docker containers:"
+            docker ps -a
+            exit 1
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 3: Install & Start Cloudflare Tunnel
+      # ───────────────────────────────────────────────
+      - name: 🌐 Setup Cloudflare Tunnel
+        id: cloudflare-tunnel
+        run: |
+          echo "⬇️ Downloading & installing cloudflared..."
+          curl -L -s --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          rm -f cloudflared.deb
+
+          echo "🚀 Launching Cloudflare Tunnel for http://localhost:8000 ..."
+          rm -f /tmp/cloudflared.log
+          cloudflared tunnel --protocol http2 --url http://localhost:8000 --logfile /tmp/cloudflared.log > /dev/null 2>&1 &
+
+          echo "⏳ Waiting for Cloudflare Tunnel URL..."
+          CF_URL=""
+          for i in {1..30}; do
+            sleep 2
+            if [ -f /tmp/cloudflared.log ]; then
+              CF_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$CF_URL" ]; then
+                echo "✅ Found Cloudflare URL on attempt $i: $CF_URL"
+                break
+              fi
+            fi
+          done
+
+          if [ -n "$CF_URL" ]; then
+            echo ""
+            echo "================================================================="
+            echo "🌐 COOLIFY DASHBOARD URL: $CF_URL"
+            echo "================================================================="
+            echo ""
+            echo "COOLIFY_URL=$CF_URL" >> $GITHUB_ENV
+          else
+            echo "⚠️ Cloudflare Tunnel URL could not be extracted within time limit."
+            if [ -f /tmp/cloudflared.log ]; then
+              echo "--- Cloudflare Log Content ---"
+              cat /tmp/cloudflared.log || true
+            fi
+            echo "COOLIFY_URL=Not Available" >> $GITHUB_ENV
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 4: Send Details via Telegram
+      # ───────────────────────────────────────────────
+      - name: 📲 Send Details to Telegram
+        run: |
+          botToken="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chatId="${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if [ -z "$botToken" ] || [ -z "$chatId" ]; then
+            echo "⚠️ Telegram secrets not set. Skipping notification."
+          else
+            message="🚀 <b>Coolify Instance is Ready!</b>"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="🔗 <b>Dashboard URL:</b> <code>${COOLIFY_URL}</code>"$'\n'
+            message+="⚙️ <b>Port:</b> <code>8000</code>"$'\n'
+            message+="👤 <b>Setup:</b> Register your root admin account on first visit"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⏱️ <b>Uptime:</b> ~5h 50m"$'\n'
+            message+="🔁 <b>Run:</b> #${{ github.run_number }}"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⚡ <i>Powered by Redwanul Haque</i>"
+
+            payload=$(jq -n \
+              --arg chat_id "$chatId" \
+              --arg text "$message" \
+              --arg parse_mode "HTML" \
+              '{chat_id: $chat_id, text: $text, parse_mode: $parse_mode}')
+
+            curl -s -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$payload" > /dev/null || true
+            echo "✅ Telegram notification sent!"
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 5: Print Details & Keep Alive
+      # ───────────────────────────────────────────────
+      - name: 📢 Print Details & Keep Alive
+        run: |
+          echo ""
+          echo "================================================================="
+          echo "⚡ Powered by Redwanul Haque"
+          echo "-----------------------------------------------------------------"
+          echo "Coolify Dashboard URL: ${COOLIFY_URL}"
+          echo "Default Service Port : 8000"
+          echo "Account Setup        : Open the URL to create your root admin user"
+          echo "================================================================="
+          echo ""
+
+          m=350
+          for i in $(seq 1 $m); do
+            l=$((m - i))
+            pct=$((i * 100 / m))
+            echo "[$(date +'%H:%M:%S')] ⏱️ $l min remaining ($pct% elapsed)"
+            sleep 60
+          done
+
+      # ───────────────────────────────────────────────
+      # Step 6: Chain Rotation Engine
+      # ───────────────────────────────────────────────
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          inputLoops="${{ github.event.inputs.loops }}"
+          if [ -z "$inputLoops" ]; then
+            loops=4
+          else
+            loops=$inputLoops
+          fi
+
+          if [ "$loops" -le 1 ]; then
+            echo "🎯 Chain Finished Successfully. Total iterations completed."
+            exit 0
+          fi
+
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is missing. Cannot dispatch next iteration."
+            exit 1
+          fi
+
+          next=$((loops - 1))
+          echo "🔁 Dispatching next iteration: $next remaining..."
+
+          payload=$(jq -n \
+            --arg ref "${{ github.ref_name }}" \
+            --arg next "$next" \
+            '{ref: $ref, inputs: {loops: $next}}')
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/coolify-runner.yml/dispatches" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "✅ Secured handoff executed to loop iteration: $next"
+          else
+            echo "⚠️ Chain dispatch returned HTTP status $http_code:"
+            echo "$body"
+            echo "💡 Tip: Ensure .github/workflows/coolify-runner.yml is committed and pushed to your default branch."
+          fi
+          

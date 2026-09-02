@@ -1,4 +1,4 @@
-name: Tailscale Gigabit VPN (Ubuntu Loop) - Hardened v2
+name: V2 Tailscale Gigabit VPN (Ubuntu Loop) - Hardened v2
 
 on:
   workflow_dispatch:

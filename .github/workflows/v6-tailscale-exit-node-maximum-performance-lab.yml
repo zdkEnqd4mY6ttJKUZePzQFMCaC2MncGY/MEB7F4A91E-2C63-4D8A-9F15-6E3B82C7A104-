@@ -9,7 +9,7 @@ on:
         default: "335"
         type: string
       loops:
-        description: "Optional number of chained runs (blank = no chain)"
+        description: "Optional number of chain rotations (blank = continuous)"
         required: false
         default: ""
         type: string
@@ -23,283 +23,289 @@ permissions:
   actions: write
 
 jobs:
-  exit-node:
+  vpn:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     env:
       TS_NODE: github-gigabit-vpn
-      TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-      GH_PAT: ${{ secrets.GH_PAT }}
 
     steps:
-      - name: Validate secrets
+      - name: Validate secrets and inputs
         shell: bash
         run: |
           set -euo pipefail
 
-          [[ -n "${GH_PAT}" ]] || {
-            echo "ERROR: GH_PAT secret is missing."
-            exit 1
-          }
+          : "${GH_PAT:?GH_PAT secret is required}"
+          : "${TAILSCALE_AUTH_KEY:?TAILSCALE_AUTH_KEY secret is required}"
 
-          [[ -n "${TS_AUTH_KEY}" ]] || {
-            echo "ERROR: TAILSCALE_AUTH_KEY secret is missing."
+          DURATION="${{ inputs.duration }}"
+          if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then
+            echo "duration must be an integer"
             exit 1
-          }
+          fi
+
+          if (( DURATION < 1 || DURATION > 335 )); then
+            echo "duration must be between 1 and 335 minutes"
+            exit 1
+          fi
 
       - name: Inspect runner
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "=== RUNNER ==="
-          echo "Host: $(hostname)"
-          echo "Kernel: $(uname -a)"
-          echo "OS:"
-          cat /etc/os-release | sed -n '1,8p'
-
+          echo "===== RUNNER ====="
+          uname -a
+          cat /etc/os-release || true
           echo
           echo "CPU:"
           nproc
-          lscpu | grep -E 'Model name|CPU\(s\)|Thread|Core' | head -10 || true
-
+          lscpu | sed -n '1,25p' || true
           echo
-          echo "Memory:"
+          echo "MEMORY:"
           free -h
-
           echo
-          echo "Routes:"
-          ip route
-
-          echo
-          echo "Interfaces:"
+          echo "NETWORK:"
           ip -br addr
+          ip route
+          echo
+          echo "DEFAULT INTERFACE:"
+          ip route get 8.8.8.8
 
-          IFACE="$(ip route get 8.8.8.8 | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-          [[ -n "$IFACE" ]] || {
-            echo "ERROR: Could not determine outbound interface."
+      - name: Detect network interface
+        id: net
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFACE="$(ip route get 8.8.8.8 | awk '
+            {
+              for (i=1; i<=NF; i++)
+                if ($i == "dev") { print $(i+1); exit }
+            }')"
+
+          if [[ -z "$IFACE" ]]; then
+            echo "Could not detect default network interface"
             exit 1
-          }
+          fi
 
-          echo "Outbound interface: $IFACE"
+          echo "iface=$IFACE" >> "$GITHUB_OUTPUT"
+          echo "Using interface: $IFACE"
 
       - name: Inspect NIC capabilities
         shell: bash
         run: |
           set -euo pipefail
 
-          IFACE="$(ip route get 8.8.8.8 | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+          IFACE="${{ steps.net.outputs.iface }}"
 
-          echo "=== NIC OFFLOADS ==="
-          ethtool -k "$IFACE" 2>/dev/null || true
+          echo "===== ETHTOOL FEATURES ====="
+          sudo ethtool -k "$IFACE" || true
 
           echo
-          echo "=== NIC SPEED ==="
-          ethtool "$IFACE" 2>/dev/null | grep -E 'Speed:|Duplex:|Auto-negotiation:' || true
+          echo "===== ETHTOOL COALESCE ====="
+          sudo ethtool -c "$IFACE" || true
 
-      - name: Baseline Internet connectivity
+          echo
+          echo "===== ETHTOOL CHANNELS ====="
+          sudo ethtool -l "$IFACE" || true
+
+          echo
+          echo "===== NIC DRIVER ====="
+          sudo ethtool -i "$IFACE" || true
+
+      - name: Baseline internet path
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "=== PUBLIC IP ==="
-          curl --fail --silent --show-error --max-time 15 https://api.ipify.org
+          echo "===== PUBLIC IP ====="
+          curl --fail --silent --show-error --max-time 15 https://api.ipify.org || true
           echo
 
-          echo
-          echo "=== CLOUDFLARE HTTP BASELINE ==="
+          echo "===== CLOUDFLARE HTTP LATENCY ====="
           curl --fail --silent --show-error \
-            --output /dev/null \
-            --write-out 'HTTP=%{http_code} connect=%{time_connect}s starttransfer=%{time_starttransfer}s total=%{time_total}s\n' \
-            --max-time 30 \
-            https://speed.cloudflare.com/__down?bytes=10000000
+            -o /dev/null \
+            -w 'HTTP=%{http_code} connect=%{time_connect}s tls=%{time_appconnect}s total=%{time_total}s\n' \
+            --max-time 20 \
+            https://speed.cloudflare.com/ || true
 
       - name: Tune Linux networking
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "=== NETWORK TUNING ==="
+          echo "===== TCP CONGESTION ====="
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr || true
+          sudo sysctl -w net.core.default_qdisc=fq || true
 
-          # Modern congestion control / queueing.
-          sysctl -w net.ipv4.tcp_congestion_control=bbr 2>/dev/null || true
-          sysctl -w net.core.default_qdisc=fq 2>/dev/null || true
+          echo "===== FORWARDING ====="
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
 
-          # Forwarding for exit-node traffic.
-          sysctl -w net.ipv4.ip_forward=1
-          sysctl -w net.ipv6.conf.all.forwarding=1
+          echo "===== SOCKET BUFFERS ====="
+          sudo sysctl -w net.core.rmem_max=67108864
+          sudo sysctl -w net.core.wmem_max=67108864
+          sudo sysctl -w net.core.rmem_default=262144
+          sudo sysctl -w net.core.wmem_default=262144
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 131072 67108864"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 16384 67108864"
 
-          # Larger socket buffers.
-          sysctl -w net.core.rmem_max=67108864
-          sysctl -w net.core.wmem_max=67108864
-          sysctl -w net.ipv4.tcp_rmem='4096 87380 67108864'
-          sysctl -w net.ipv4.tcp_wmem='4096 65536 67108864'
+          echo "===== NETWORK BACKLOG ====="
+          sudo sysctl -w net.core.netdev_max_backlog=250000
+          sudo sysctl -w net.ipv4.tcp_max_syn_backlog=8192
 
-          # Higher packet backlog for bursts.
-          sysctl -w net.core.netdev_max_backlog=250000
-
-          # TCP behavior.
-          sysctl -w net.ipv4.tcp_mtu_probing=1
-          sysctl -w net.ipv4.tcp_fastopen=3
+          echo "===== TCP BEHAVIOR ====="
+          sudo sysctl -w net.ipv4.tcp_mtu_probing=1
+          sudo sysctl -w net.ipv4.tcp_fastopen=3
 
           echo
-          echo "=== ACTIVE TCP CONGESTION CONTROL ==="
           sysctl net.ipv4.tcp_congestion_control
           sysctl net.core.default_qdisc
-
-          echo
-          echo "=== FORWARDING ==="
           sysctl net.ipv4.ip_forward
           sysctl net.ipv6.conf.all.forwarding
+
+      - name: Enable Tailscale Linux UDP forwarding offload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFACE="${{ steps.net.outputs.iface }}"
+
+          # Recommended by Tailscale for Linux 6.2+ exit nodes/subnet routers.
+          sudo ethtool -K "$IFACE" rx-udp-gro-forwarding on rx-gro-list off || true
+
+          echo "===== RESULTING OFFLOAD SETTINGS ====="
+          sudo ethtool -k "$IFACE" | grep -E \
+            'rx-gro|rx-udp-gro-forwarding|rx-gro-list|tx-gro' || true
 
       - name: Install Tailscale
         shell: bash
         run: |
           set -euo pipefail
 
-          curl --fail --silent --show-error https://tailscale.com/install.sh | sh
+          curl --fail --silent --show-error --retry 3 \
+            https://tailscale.com/install.sh | sh
 
           tailscale version
 
-      - name: Enable Tailscale Linux exit-node offload
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          IFACE="$(ip route get 8.8.8.8 | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-
-          echo "Interface: $IFACE"
-
-          # Recommended Tailscale Linux 6.2+ forwarding optimization.
-          # If the runner kernel/NIC does not support these options, continue.
-          ethtool -K "$IFACE" rx-udp-gro-forwarding on rx-gro-list off 2>&1 || true
-
-          echo
-          echo "=== RESULTING OFFLOAD STATE ==="
-          ethtool -k "$IFACE" 2>/dev/null | grep -E 'rx-udp-gro-forwarding|rx-gro-list' || true
-
       - name: Start Tailscale exit node
         shell: bash
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           set -euo pipefail
 
-          tailscale up \
-            --authkey="${TS_AUTH_KEY}" \
-            --hostname="${TS_NODE}" \
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTH_KEY" \
+            --hostname="$TS_NODE" \
             --advertise-exit-node \
             --accept-routes \
             --reset
 
-          echo
-          echo "=== TAILSCALE STATUS ==="
+          echo "===== TAILSCALE STATUS ====="
           tailscale status
 
           echo
-          echo "=== TAILSCALE IP ==="
+          echo "===== TAILSCALE IP ====="
           tailscale ip -4
 
           echo
-          echo "=== TAILSCALE NETCHECK ==="
-          tailscale netcheck
-
-          echo
-          echo "=== TAILSCALE PREFERENCES ==="
+          echo "===== TAILSCALE PREFERENCES ====="
           tailscale debug prefs
 
-      - name: Detect and test active Tailscale peers
+      - name: Diagnose active Tailscale clients automatically
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "=================================================="
-          echo "AUTO CLIENT / PATH DIAGNOSTICS V6"
-          echo "=================================================="
+          echo "============================================================"
+          echo "V6 AUTOMATIC CLIENT / PATH DIAGNOSTICS"
+          echo "============================================================"
 
-          SELF_IP="$(tailscale ip -4 | head -n1)"
-          echo "Exit node: ${SELF_IP} (${TS_NODE})"
-
+          TS_IP="$(tailscale ip -4)"
+          echo "Exit node Tailscale IP: $TS_IP"
           echo
-          echo "=== PEERS ==="
+
+          echo "===== PEERS ====="
           tailscale status
-
           echo
-          echo "=== ONLINE PEERS ==="
 
-          # Tailscale status --json gives structured peer state.
-          # We prefer peers currently marked Online and exclude this runner.
+          echo "===== AUTOMATIC PEER TESTS ====="
+
+          # tailscale status --json gives us the current peer list.
+          # We test only peers that are currently considered online.
           mapfile -t PEERS < <(
-            tailscale status --json 2>/dev/null |
-            python3 -c '
-import json,sys
-try:
-    d=json.load(sys.stdin)
-    peers=d.get("Peer",{}) or {}
-    for _,p in peers.items():
-        ip=(p.get("TailscaleIPs") or [""])[0]
-        host=p.get("HostName") or p.get("DNSName") or ""
-        online=p.get("Online",False)
-        if online and ip and not ip.startswith("100.70.62.125"):
-            print(f"{ip}\t{host}")
-except Exception:
-    pass
-'
-          )
-
-          if [[ "${#PEERS[@]}" -eq 0 ]]; then
-            echo "No online peer was automatically detected."
-            echo
-            echo "If the Realme is connected, wait a few seconds and inspect:"
-            tailscale status
-          else
-            echo "Detected ${#PEERS[@]} online peer(s)."
-          fi
-
-          echo
-          echo "=== TAILSCALE PING / PATH TEST ==="
-
-          for entry in "${PEERS[@]}"; do
-            IP="${entry%%$'\t'*}"
-            HOST="${entry#*$'\t'}"
-
-            echo
-            echo "--- ${HOST} (${IP}) ---"
-
-            # tailscale ping reports direct vs DERP/relay path.
-            # We intentionally do not fail the workflow if one peer is unreachable.
-            tailscale ping --c 5 --timeout=5s "$IP" 2>&1 || true
-          done
-
-          echo
-          echo "=== NOTE ==="
-          echo "This test identifies the Tailscale transport path from the GitHub runner"
-          echo "to online peers. It does not by itself prove which peer is actively"
-          echo "using this runner as its exit node."
-
-      - name: Capture Tailscale transport state
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          echo "=== TAILSCALE STATUS JSON SUMMARY ==="
-
-          tailscale status --json |
+            tailscale status --json |
             python3 -c '
 import json,sys
 d=json.load(sys.stdin)
-peers=d.get("Peer",{}) or {}
-for _,p in peers.items():
-    ips=p.get("TailscaleIPs") or []
-    ip=ips[0] if ips else "-"
-    host=p.get("HostName") or p.get("DNSName") or "-"
+self_ip=d.get("Self",{}).get("TailscaleIPs",[])
+for p in d.get("Peer",{}).values():
+    ips=p.get("TailscaleIPs",[])
     online=p.get("Online",False)
-    active=p.get("Active",False)
-    relay=p.get("Relay","")
-    cur=p.get("CurAddr","")
-    print(f"{host:35} ip={ip:16} online={str(online):5} active={str(active):5} relay={relay or "-":8} addr={cur or "-"}")
+    host=p.get("HostName") or p.get("DNSName") or "unknown"
+    if online and ips:
+        ip=ips[0]
+        if ip not in self_ip:
+            print(f"{ip}|{host}")
 '
+          )
 
-      - name: Telegram notification
+          if (( ${#PEERS[@]} == 0 )); then
+            echo "No online Tailscale peers detected."
+          else
+            for entry in "${PEERS[@]}"; do
+              PEER_IP="${entry%%|*}"
+              PEER_NAME="${entry#*|}"
+
+              echo
+              echo "------------------------------------------------------------"
+              echo "Peer: $PEER_NAME"
+              echo "IP:   $PEER_IP"
+              echo "------------------------------------------------------------"
+
+              # This reveals direct vs DERP vs peer-relay.
+              tailscale ping --c 5 "$PEER_IP" || true
+            done
+          fi
+
+          echo
+          echo "===== IMPORTANT ====="
+          echo "The Realme should appear above automatically if it is online."
+          echo "A result containing 'via DERP(...)' means relay path."
+          echo "A result containing an IP:41641 means direct UDP path."
+          echo "This diagnostic does not assume which peer is using the exit node."
+
+      - name: Check Tailscale network health
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "===== NETCHECK ====="
+          tailscale netcheck
+
+          echo
+          echo "===== STATUS ====="
+          tailscale status
+
+          echo
+          echo "===== IP ====="
+          tailscale ip -4
+
+          echo
+          echo "===== PREFS ====="
+          tailscale debug prefs
+
+          # Fail closed if the node did not advertise an exit route.
+          if ! tailscale debug prefs | grep -q '"0.0.0.0/0"'; then
+            echo "Exit route was not advertised."
+            exit 1
+          fi
+
+      - name: Notify Telegram
+        if: always()
         shell: bash
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -308,19 +314,26 @@ for _,p in peers.items():
           set -euo pipefail
 
           if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
-            echo "Telegram secrets not configured; skipping notification."
+            echo "Telegram secrets not configured; skipping."
             exit 0
           fi
 
-          TS_IP="$(tailscale ip -4 | head -n1)"
+          TS_IP="$(tailscale ip -4 2>/dev/null || echo unknown)"
+          STATUS="$(tailscale status 2>/dev/null | head -25 || true)"
 
-          MESSAGE="V6 Tailscale exit node is online%0A%0AHost: ${TS_NODE}%0ATailscale IP: ${TS_IP}%0ADuration: ${{ inputs.duration }} minutes%0A%0AAuto client/path diagnostics completed."
+          MESSAGE="V6 Tailscale exit node ready
+Node: $TS_NODE
+Tailscale IP: $TS_IP
+Duration: ${{ inputs.duration }} minutes
 
-          curl --fail --silent --show-error \
-            --max-time 20 \
-            --data "chat_id=${TELEGRAM_CHAT_ID}" \
-            --data "text=${MESSAGE}" \
-            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
+$STATUS"
+
+          curl --fail --silent --show-error --retry 2 \
+            -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}" \
+            >/dev/null
 
       - name: Keep exit node alive
         shell: bash
@@ -328,73 +341,78 @@ for _,p in peers.items():
           set -euo pipefail
 
           DURATION="${{ inputs.duration }}"
-
-          if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: duration must be an integer."
-            exit 1
-          fi
-
-          if (( DURATION < 1 || DURATION > 335 )); then
-            echo "ERROR: duration must be between 1 and 335 minutes."
-            exit 1
-          fi
-
-          echo "Keeping exit node alive for ${DURATION} minutes."
-
+          SECONDS_TOTAL=$((DURATION * 60))
           START="$(date +%s)"
-          END=$((START + DURATION * 60))
+          NEXT_REPORT=0
 
-          while (( $(date +%s) < END )); do
-            sleep 60
+          echo "Keeping exit node alive for $DURATION minutes."
 
-            echo
-            echo "=== HEARTBEAT $(date -u '+%Y-%m-%d %H:%M:%S UTC') ==="
+          while true; do
+            NOW="$(date +%s)"
+            ELAPSED=$((NOW - START))
 
-            tailscale status --peers=false || true
-            tailscale netcheck 2>/dev/null | grep -E 'UDP:|IPv4:|IPv6:|Nearest DERP:|DERP latency:' || true
-
-            IFACE="$(ip route get 8.8.8.8 | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-
-            if [[ -n "$IFACE" && -r "/sys/class/net/${IFACE}/statistics/rx_bytes" ]]; then
-              RX="$(cat "/sys/class/net/${IFACE}/statistics/rx_bytes")"
-              TX="$(cat "/sys/class/net/${IFACE}/statistics/tx_bytes")"
-              echo "Interface ${IFACE}: RX=${RX} bytes TX=${TX} bytes"
+            if (( ELAPSED >= SECONDS_TOTAL )); then
+              break
             fi
+
+            if (( ELAPSED >= NEXT_REPORT )); then
+              echo
+              echo "===== RUNTIME REPORT: ${ELAPSED}s ====="
+              tailscale status || true
+              tailscale netcheck || true
+
+              IFACE="${{ steps.net.outputs.iface }}"
+              echo
+              echo "===== INTERFACE COUNTERS ====="
+              ip -s link show "$IFACE" || true
+
+              NEXT_REPORT=$((ELAPSED + 300))
+            fi
+
+            sleep 30
           done
 
-      - name: Chain next workflow
-        if: ${{ inputs.loops != '' && inputs.loops != '0' }}
+      - name: Rotate workflow chain
+        if: success()
         shell: bash
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         run: |
           set -euo pipefail
 
-          LOOPS="${{ inputs.loops }}"
+          REPO="${GITHUB_REPOSITORY}"
+          WORKFLOW="v6-tailscale-exit-node-maximum-performance-lab.yml"
+          REF="${GITHUB_REF_NAME:-main}"
 
-          if ! [[ "$LOOPS" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: loops must be a non-negative integer."
+          if [[ -z "${GH_PAT:-}" ]]; then
+            echo "GH_PAT is missing."
             exit 1
           fi
 
-          if (( LOOPS <= 0 )); then
-            echo "No further runs requested."
-            exit 0
-          fi
+          echo "Dispatching next V6 runner..."
 
-          NEXT=$((LOOPS - 1))
+          HTTP_CODE="$(
+            curl --silent --show-error \
+              --output /tmp/dispatch-response \
+              --write-out '%{http_code}' \
+              --fail-with-body \
+              -X POST \
+              -H "Authorization: Bearer ${GH_PAT}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches" \
+              -d "{\"ref\":\"${REF}\"}"
+          )"
 
-          echo "Dispatching V6 next run. Remaining loops: ${NEXT}"
-
-          curl --fail --silent --show-error \
-            --request POST \
-            --header "Authorization: Bearer ${GH_PAT}" \
-            --header "Accept: application/vnd.github+json" \
-            --header "X-GitHub-Api-Version: 2022-11-28" \
-            --data "{\"ref\":\"main\",\"inputs\":{\"duration\":\"${{ inputs.duration }}\",\"loops\":\"${NEXT}\"}}" \
-            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/v6-tailscale-exit-node-maximum-performance-lab.yml/dispatches"
+          echo "GitHub dispatch HTTP status: $HTTP_CODE"
 
       - name: Cleanup Tailscale
         if: always()
         shell: bash
         run: |
-          tailscale logout 2>/dev/null || true
-          tailscale down 2>/dev/null || true
+          set +e
+
+          sudo tailscale logout
+          sudo tailscale down
+
+          echo "Tailscale cleanup completed."

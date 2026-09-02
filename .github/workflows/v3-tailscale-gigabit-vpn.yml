@@ -1,4 +1,4 @@
-name: Tailscale High-Throughput Exit Node
+name: V3 Tailscale High-Throughput Exit Node
 
 on:
   workflow_dispatch:

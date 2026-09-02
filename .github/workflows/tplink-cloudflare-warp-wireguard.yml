@@ -1,0 +1,292 @@
+name: Cloudflare WARP WireGuard VPN — TP-Link Ready
+
+on:
+  workflow_dispatch:
+    inputs:
+      profiles_count:
+        description: "👥 Number of unique profiles to generate (1 to 5)"
+        required: false
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+      duration:
+        description: "⏱️ Runtime in minutes (max 345)"
+        required: false
+        default: "340"
+        type: string
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: wireguard-qr-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  wireguard-qr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: 🔑 Validate GitHub Token
+        id: validate
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is not set! Go to repo Settings > Secrets and variables > Actions and add GH_PAT."
+            exit 1
+          fi
+          echo "✅ GH_PAT secret is configured (${#token} chars)."
+
+      - name: 🧠 System Information
+        run: |
+          echo "=============================================="
+          echo "🖥️ GitHub Actions Runner Specs"
+          echo "CPU Cores : $(nproc)"
+          echo "RAM       : $(free -h | awk '/^Mem:/ {print $2}')"
+          echo "Disk Free : $(df -h / | awk 'NR==2 {print $4}')"
+          echo "=============================================="
+
+      - name: ⚙️ Generate Cloudflare WARP WireGuard Profiles & QR Codes
+        id: generate-wg
+        run: |
+          echo "📦 Installing WireGuard tools & qrencode..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools qrencode jq curl
+
+          echo "⬇️ Downloading wgcf..."
+          token="${{ secrets.GH_PAT }}"
+
+          WGCF_URL=$(curl -s \
+            ${token:+-H "Authorization: Bearer $token"} \
+            "https://api.github.com/repos/ViRb3/wgcf/releases/latest" |
+            jq -r '.assets[]? | select(.name | test("linux_amd64$")) | .browser_download_url' |
+            head -n 1)
+
+          if [ -z "$WGCF_URL" ] || [ "$WGCF_URL" = "null" ]; then
+            WGCF_URL="https://github.com/ViRb3/wgcf/releases/download/v2.2.26/wgcf_2.2.26_linux_amd64"
+          fi
+
+          echo "📥 Downloading wgcf from: $WGCF_URL"
+          sudo curl -fsSL --retry 3 "$WGCF_URL" -o /usr/local/bin/wgcf
+          sudo chmod +x /usr/local/bin/wgcf
+
+          COUNT="${{ github.event.inputs.profiles_count || '1' }}"
+          [[ ! "$COUNT" =~ ^[1-5]$ ]] && COUNT=1
+          echo "PROFILES_COUNT=$COUNT" >> "$GITHUB_ENV"
+
+          echo "🔐 Generating $COUNT Cloudflare WARP WireGuard profiles..."
+          mkdir -p /tmp/wg_profiles
+
+          for i in $(seq 1 "$COUNT"); do
+            echo "⚙️ Generating Profile #$i..."
+            DIR="/tmp/wg_gen_$i"
+            mkdir -p "$DIR"
+
+            (
+              cd "$DIR"
+              wgcf register --accept-tos
+              wgcf generate
+            )
+
+            if [ -f "$DIR/wgcf-profile.conf" ]; then
+              NORMAL_CONF="/tmp/wg_profiles/wireguard_user_$i.conf"
+              TPLINK_CONF="/tmp/wg_profiles/cloudflare_warp_tplink_$i.conf"
+
+              # Keep the original wgcf profile untouched.
+              cp "$DIR/wgcf-profile.conf" "$NORMAL_CONF"
+
+              # Build a TP-Link-compatible version.
+              # TP-Link supports the basic WireGuard fields but may reject
+              # IPv6 addresses, MTU, and IPv6 AllowedIPs during import.
+              awk '
+                BEGIN { IGNORECASE=1 }
+                /^Address[[:space:]]*=/ {
+                  value=$0
+                  sub(/^[^=]*=[[:space:]]*/, "", value)
+                  split(value, parts, ",")
+                  print "Address = " parts[1]
+                  next
+                }
+                /^MTU[[:space:]]*=/ { next }
+                /^AllowedIPs[[:space:]]*=/ {
+                  value=$0
+                  sub(/^[^=]*=[[:space:]]*/, "", value)
+                  split(value, parts, ",")
+                  print "AllowedIPs = " parts[1]
+                  next
+                }
+                { print }
+              ' "$NORMAL_CONF" > "$TPLINK_CONF"
+
+              # QR code for the TP-Link-ready profile.
+              qrencode                 -o "/tmp/wg_profiles/wireguard_qr_$i.png"                 -s 10 -m 2                 < "$TPLINK_CONF"
+
+              echo "✅ Profile #$i generated successfully!"
+              echo "📄 Normal config : $NORMAL_CONF"
+              echo "📄 TP-Link config: $TPLINK_CONF"
+            else
+              echo "⚠️ Failed to generate Profile #$i"
+            fi
+
+            sleep 1
+          done
+
+      - name: 📋 Profiles Summary
+        run: |
+          COUNT="${{ env.PROFILES_COUNT || '1' }}"
+
+          echo "================================================================="
+          echo "✅ $COUNT WireGuard Profiles Generated!"
+          echo "📲 TP-Link-ready QR codes & .conf files will be sent to Telegram."
+          echo "================================================================="
+
+          for i in $(seq 1 "$COUNT"); do
+            CONF="/tmp/wg_profiles/wireguard_user_$i.conf"
+            TPLINK="/tmp/wg_profiles/cloudflare_warp_tplink_$i.conf"
+            if [ -f "$CONF" ]; then
+              echo "📄 Profile #$i: wireguard_user_$i.conf (Normal)"
+            fi
+            if [ -f "$TPLINK" ]; then
+              echo "📄 Profile #$i: cloudflare_warp_tplink_$i.conf (TP-Link Ready)"
+            fi
+          done
+
+          echo "================================================================="
+
+      - name: 📲 Send TP-Link-Ready Profiles to Telegram
+        run: |
+          botToken="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chatId="${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if [ -z "$botToken" ] || [ -z "$chatId" ]; then
+            echo "⚠️ Telegram secrets not set. Skipping Telegram delivery."
+            exit 0
+          fi
+
+          COUNT="${{ env.PROFILES_COUNT || '1' }}"
+
+          for i in $(seq 1 "$COUNT"); do
+            QR="/tmp/wg_profiles/wireguard_qr_$i.png"
+            NORMAL="/tmp/wg_profiles/wireguard_user_$i.conf"
+            TPLINK="/tmp/wg_profiles/cloudflare_warp_tplink_$i.conf"
+
+            if [ -f "$QR" ] && [ -f "$TPLINK" ]; then
+              caption="☁️ <b>Cloudflare WARP — TP-Link Profile #$i / $COUNT</b>"$'\n'
+              caption+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+              caption+="📡 <b>VPN:</b> WireGuard / Cloudflare WARP"$'\n'
+              caption+="📶 <b>Router:</b> TP-Link VPN Client"$'\n'
+              caption+="📱 <b>Import:</b> Upload the attached TP-Link .conf"$'\n'
+              caption+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+              caption+="⚠️ <i>This config is automatically cleaned for TP-Link compatibility.</i>"$'\n'
+              caption+="🔁 <b>Run:</b> #${{ github.run_number }}"$'\n'
+              caption+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+              caption+="⚡ <i>Powered by Redwanul Haque</i>"
+
+              echo "📤 Sending TP-Link QR #$i..."
+              curl -fsS --max-time 20 -X POST                 "https://api.telegram.org/bot${botToken}/sendPhoto"                 -F "chat_id=${chatId}"                 -F "photo=@${QR}"                 -F "caption=${caption}"                 -F "parse_mode=HTML" || true
+
+              echo "📤 Sending TP-Link .conf #$i..."
+              curl -fsS --max-time 20 -X POST                 "https://api.telegram.org/bot${botToken}/sendDocument"                 -F "chat_id=${chatId}"                 -F "document=@${TPLINK}"                 -F "caption=☁️ Cloudflare WARP — TP-Link Ready Profile #$i (.conf)" || true
+
+              echo "📤 Sending original WireGuard .conf #$i..."
+              if [ -f "$NORMAL" ]; then
+                curl -fsS --max-time 20 -X POST                   "https://api.telegram.org/bot${botToken}/sendDocument"                   -F "chat_id=${chatId}"                   -F "document=@${NORMAL}"                   -F "caption=📄 Original Cloudflare WARP WireGuard Profile #$i (.conf)" || true
+              fi
+
+              sleep 1
+            fi
+          done
+
+          echo "✅ All $COUNT TP-Link-ready profiles delivered to Telegram."
+
+      - name: 📢 Print Details & Keep Alive
+        run: |
+          echo ""
+          echo "================================================================="
+          echo "⚡ Powered by Redwanul Haque"
+          echo "-----------------------------------------------------------------"
+          echo "Status   : Cloudflare WARP WireGuard profiles generated"
+          echo "Profiles : ${{ env.PROFILES_COUNT }} independent profiles"
+          echo "================================================================="
+          echo ""
+
+          m="${{ github.event.inputs.duration || '340' }}"
+          [[ ! "$m" =~ ^[0-9]+$ ]] && m=340
+          [ "$m" -gt 345 ] && m=345
+
+          for i in $(seq 1 "$m"); do
+            l=$((m - i))
+            pct=$((i * 100 / m))
+            echo "[$(date +'%H:%M:%S')] ⏱️ $l min remaining ($pct% elapsed)"
+            sleep 60
+          done
+
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          inputLoops="${{ github.event.inputs.loops }}"
+          loops="${inputLoops:-4}"
+
+          [[ ! "$loops" =~ ^[0-9]+$ ]] && loops=4
+
+          if [ "$loops" -le 1 ]; then
+            echo "🎯 Chain finished successfully."
+            exit 0
+          fi
+
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT is missing. Cannot dispatch next iteration."
+            exit 1
+          fi
+
+          next=$((loops - 1))
+          echo "🔁 Dispatching next iteration: $next remaining..."
+
+          payload=$(jq -n \
+            --arg ref "${{ github.ref_name }}" \
+            --arg count "${{ env.PROFILES_COUNT || '1' }}" \
+            --arg duration "${{ github.event.inputs.duration || '340' }}" \
+            --arg next "$next" \
+            '{
+              ref: $ref,
+              inputs: {
+                profiles_count: $count,
+                duration: $duration,
+                loops: $next
+              }
+            }')
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/tplink-cloudflare-warp-wireguard.yml/dispatches" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "✅ Next workflow iteration dispatched: $next remaining."
+          else
+            echo "⚠️ Chain dispatch returned HTTP status $http_code:"
+            echo "$body"
+          fi

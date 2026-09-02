@@ -1,0 +1,707 @@
+name: V8 Raw WireGuard Exit Node - Maximum Performance Lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "How long to keep WireGuard alive (minutes)"
+        required: true
+        default: "335"
+        type: string
+
+concurrency:
+  group: wireguard-server-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  wireguard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      WG_INTERFACE: wg0
+      WG_PORT: "51820"
+      WG_SERVER_IP: "10.66.66.1"
+      WG_CLIENT_IP: "10.66.66.2"
+      WG_NETWORK: "10.66.66.0/24"
+
+    steps:
+
+      # ============================================================
+      # VALIDATION
+      # ============================================================
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DURATION="${{ inputs.duration }}"
+
+          if ! [[ "$DURATION" =~ ^[0-9]+$ ]]; then
+            echo "duration must be an integer"
+            exit 1
+          fi
+
+          if (( DURATION < 1 || DURATION > 335 )); then
+            echo "duration must be between 1 and 335 minutes"
+            exit 1
+          fi
+
+          echo "Validation passed."
+
+      # ============================================================
+      # RUNNER INFORMATION
+      # ============================================================
+
+      - name: Inspect runner
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "RUNNER INFORMATION"
+          echo "============================================================"
+
+          echo
+          echo "Kernel:"
+          uname -a
+
+          echo
+          echo "OS:"
+          cat /etc/os-release
+
+          echo
+          echo "CPU:"
+          nproc
+          lscpu | sed -n '1,30p' || true
+
+          echo
+          echo "Memory:"
+          free -h
+
+          echo
+          echo "Interfaces:"
+          ip -br addr
+
+          echo
+          echo "Routes:"
+          ip route
+
+          echo
+          echo "Default route:"
+          ip route get 8.8.8.8
+
+      # ============================================================
+      # NETWORK INTERFACE
+      # ============================================================
+
+      - name: Detect network interface
+        id: net
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFACE="$(
+            ip route get 8.8.8.8 |
+            awk '
+              {
+                for (i = 1; i <= NF; i++) {
+                  if ($i == "dev") {
+                    print $(i + 1)
+                    exit
+                  }
+                }
+              }
+            '
+          )"
+
+          if [[ -z "$IFACE" ]]; then
+            echo "Could not detect default network interface."
+            exit 1
+          fi
+
+          echo "iface=$IFACE" >> "$GITHUB_OUTPUT"
+
+          echo "Default interface: $IFACE"
+
+      # ============================================================
+      # PUBLIC IP
+      # ============================================================
+
+      - name: Detect public IPv4
+        id: publicip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBLIC_IP="$(
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --max-time 15 \
+              https://api.ipify.org
+          )"
+
+          if ! [[ "$PUBLIC_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid public IPv4: $PUBLIC_IP"
+            exit 1
+          fi
+
+          echo "public_ip=$PUBLIC_IP" >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "Public IPv4:"
+          echo "$PUBLIC_IP"
+
+      # ============================================================
+      # INSTALL WIREGUARD
+      # ============================================================
+
+      - name: Install WireGuard
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "INSTALLING WIREGUARD"
+          echo "============================================================"
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            wireguard \
+            wireguard-tools \
+            qrencode \
+            iptables \
+            iproute2 \
+            curl \
+            jq
+
+          echo
+          wg --version
+
+      # ============================================================
+      # CHECK KERNEL SUPPORT
+      # ============================================================
+
+      - name: Check WireGuard kernel support
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "WIREGUARD KERNEL SUPPORT"
+          echo "============================================================"
+
+          sudo modprobe wireguard
+
+          if ! lsmod | grep -q '^wireguard'; then
+            echo "WireGuard kernel module is not loaded."
+            exit 1
+          fi
+
+          echo
+          lsmod | grep '^wireguard'
+
+      # ============================================================
+      # NETWORK TUNING
+      # ============================================================
+
+      - name: Tune Linux networking
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "LINUX NETWORK TUNING"
+          echo "============================================================"
+
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+
+          sudo sysctl -w net.core.rmem_max=67108864
+          sudo sysctl -w net.core.wmem_max=67108864
+
+          sudo sysctl -w net.core.rmem_default=262144
+          sudo sysctl -w net.core.wmem_default=262144
+
+          sudo sysctl -w \
+            net.ipv4.tcp_rmem="4096 131072 67108864"
+
+          sudo sysctl -w \
+            net.ipv4.tcp_wmem="4096 16384 67108864"
+
+          sudo sysctl -w net.core.netdev_max_backlog=250000
+
+          sudo sysctl -w \
+            net.ipv4.tcp_congestion_control=bbr || true
+
+          sudo sysctl -w \
+            net.core.default_qdisc=fq || true
+
+          echo
+          echo "IPv4 forwarding:"
+          sysctl net.ipv4.ip_forward
+
+          echo
+          echo "IPv6 forwarding:"
+          sysctl net.ipv6.conf.all.forwarding
+
+          echo
+          echo "TCP congestion:"
+          sysctl net.ipv4.tcp_congestion_control
+
+          echo
+          echo "Queue discipline:"
+          sysctl net.core.default_qdisc
+
+      # ============================================================
+      # NIC / UDP OFFLOAD
+      # ============================================================
+
+      - name: Configure network offload
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFACE="${{ steps.net.outputs.iface }}"
+
+          echo "============================================================"
+          echo "NETWORK OFFLOAD"
+          echo "============================================================"
+
+          sudo ethtool -K \
+            "$IFACE" \
+            rx-udp-gro-forwarding on \
+            rx-gro-list off || true
+
+          echo
+          sudo ethtool -k "$IFACE" |
+            grep -E \
+              'rx-gro|rx-udp-gro-forwarding|rx-gro-list|tx-gro' \
+              || true
+
+      # ============================================================
+      # GENERATE SERVER KEYS
+      # ============================================================
+
+      - name: Generate WireGuard server keys
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo install -d -m 700 /etc/wireguard
+
+          sudo sh -c \
+            'umask 077; wg genkey > /etc/wireguard/server_private.key'
+
+          sudo sh -c \
+            'wg pubkey < /etc/wireguard/server_private.key > /etc/wireguard/server_public.key'
+
+          SERVER_PUBLIC_KEY="$(
+            sudo cat /etc/wireguard/server_public.key
+          )"
+
+          echo "SERVER_PUBLIC_KEY=$SERVER_PUBLIC_KEY" >> "$GITHUB_ENV"
+
+          echo "Server public key generated."
+
+      # ============================================================
+      # GENERATE CLIENT KEYS
+      # ============================================================
+
+      - name: Generate Realme client keys
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          umask 077
+
+          wg genkey > /tmp/client_private.key
+
+          wg pubkey \
+            < /tmp/client_private.key \
+            > /tmp/client_public.key
+
+          CLIENT_PUBLIC_KEY="$(cat /tmp/client_public.key)"
+
+          echo "CLIENT_PUBLIC_KEY=$CLIENT_PUBLIC_KEY" >> "$GITHUB_ENV"
+
+          echo "Client public key generated."
+
+      # ============================================================
+      # DETERMINE MTU
+      # ============================================================
+
+      - name: Determine WireGuard MTU
+        id: mtu
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFACE="${{ steps.net.outputs.iface }}"
+
+          MTU="$(
+            ip link show "$IFACE" |
+            awk '
+              {
+                for (i = 1; i <= NF; i++) {
+                  if ($i == "mtu") {
+                    print $(i + 1)
+                    exit
+                  }
+                }
+              }
+            '
+          )"
+
+          if [[ -z "$MTU" ]]; then
+            MTU=1500
+          fi
+
+          WG_MTU=$((MTU - 60))
+
+          if (( WG_MTU < 1280 )); then
+            WG_MTU=1280
+          fi
+
+          echo "mtu=$WG_MTU" >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "Underlay MTU: $MTU"
+          echo "WireGuard MTU: $WG_MTU"
+
+      # ============================================================
+      # SERVER CONFIGURATION
+      # ============================================================
+
+      - name: Configure WireGuard server
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          IFACE="${{ steps.net.outputs.iface }}"
+          WG_MTU="${{ steps.mtu.outputs.mtu }}"
+
+          SERVER_PRIVATE_KEY="$(
+            sudo cat /etc/wireguard/server_private.key
+          )"
+
+          sudo tee /etc/wireguard/wg0.conf > /dev/null <<EOF
+[Interface]
+Address = ${WG_SERVER_IP}/24
+ListenPort = ${WG_PORT}
+PrivateKey = ${SERVER_PRIVATE_KEY}
+MTU = ${WG_MTU}
+
+PostUp = iptables -A FORWARD -i %i -j ACCEPT
+PostUp = iptables -A FORWARD -o %i -j ACCEPT
+PostUp = iptables -t nat -A POSTROUTING -s ${WG_NETWORK} -o ${IFACE} -j MASQUERADE
+
+PostDown = iptables -D FORWARD -i %i -j ACCEPT
+PostDown = iptables -D FORWARD -o %i -j ACCEPT
+PostDown = iptables -t nat -D POSTROUTING -s ${WG_NETWORK} -o ${IFACE} -j MASQUERADE
+
+[Peer]
+PublicKey = ${CLIENT_PUBLIC_KEY}
+AllowedIPs = ${WG_CLIENT_IP}/32
+EOF
+
+          sudo chmod 600 /etc/wireguard/wg0.conf
+
+          echo "WireGuard server configuration created."
+
+      # ============================================================
+      # START SERVER
+      # ============================================================
+
+      - name: Start WireGuard server
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "STARTING RAW WIREGUARD"
+          echo "============================================================"
+
+          sudo wg-quick up "$WG_INTERFACE"
+
+          sleep 3
+
+          echo
+          echo "============================================================"
+          echo "WIREGUARD STATUS"
+          echo "============================================================"
+
+          sudo wg show
+
+          echo
+          echo "============================================================"
+          echo "WIREGUARD INTERFACE"
+          echo "============================================================"
+
+          ip -br addr show "$WG_INTERFACE"
+
+          echo
+          echo "============================================================"
+          echo "UDP 51820 LISTENER"
+          echo "============================================================"
+
+          ss -u -l -n -p |
+            grep ":${WG_PORT}" ||
+            true
+
+      # ============================================================
+      # FIREWALL DIAGNOSTICS
+      # ============================================================
+
+      - name: Inspect firewall and UDP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "UDP / FIREWALL DIAGNOSTICS"
+          echo "============================================================"
+
+          echo
+          echo "UDP listener:"
+          ss -u -l -n -p |
+            grep ":${WG_PORT}" ||
+            true
+
+          echo
+          echo "iptables:"
+          sudo iptables -S || true
+
+          echo
+          echo "iptables NAT:"
+          sudo iptables -t nat -S || true
+
+          echo
+          echo "Public IP:"
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            https://api.ipify.org
+
+          echo
+
+      # ============================================================
+      # CREATE REALME CONFIG
+      # ============================================================
+
+      - name: Create Realme WireGuard configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PUBLIC_IP="${{ steps.publicip.outputs.public_ip }}"
+
+          CLIENT_PRIVATE_KEY="$(
+            cat /tmp/client_private.key
+          )"
+
+          SERVER_PUBLIC_KEY="$(
+            sudo cat /etc/wireguard/server_public.key
+          )"
+
+          WG_MTU="${{ steps.mtu.outputs.mtu }}"
+
+          cat > /tmp/realme-wireguard.conf <<EOF
+[Interface]
+PrivateKey = ${CLIENT_PRIVATE_KEY}
+Address = ${WG_CLIENT_IP}/32
+DNS = 1.1.1.1
+MTU = ${WG_MTU}
+
+[Peer]
+PublicKey = ${SERVER_PUBLIC_KEY}
+Endpoint = ${PUBLIC_IP}:${WG_PORT}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+EOF
+
+          chmod 600 /tmp/realme-wireguard.conf
+
+          echo "============================================================"
+          echo "WIREGUARD CLIENT CONFIGURATION"
+          echo "============================================================"
+
+          cat /tmp/realme-wireguard.conf
+
+          echo
+          echo "============================================================"
+          echo "QR CODE"
+          echo "============================================================"
+
+          qrencode \
+            -t ansiutf8 \
+            < /tmp/realme-wireguard.conf
+
+      # ============================================================
+      # UPLOAD CONFIG ARTIFACT
+      # ============================================================
+
+      - name: Upload WireGuard configuration
+        uses: actions/upload-artifact@v4
+        with:
+          name: v8-wireguard-realme-config
+          path: /tmp/realme-wireguard.conf
+          retention-days: 1
+
+      # ============================================================
+      # SEND .CONF FILE TO TELEGRAM
+      # ============================================================
+
+      - name: Send WireGuard .conf to Telegram
+        if: always()
+        shell: bash
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" ||
+                -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo "Telegram secrets not configured; skipping."
+            exit 0
+          fi
+
+          CONFIG="/tmp/realme-wireguard.conf"
+          PUBLIC_IP="${{ steps.publicip.outputs.public_ip }}"
+
+          if [[ ! -f "$CONFIG" ]]; then
+            echo "WireGuard configuration file does not exist."
+            exit 1
+          fi
+
+          echo "============================================================"
+          echo "SENDING WIREGUARD CONFIG TO TELEGRAM"
+          echo "============================================================"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 2 \
+            -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+            -F "document=@${CONFIG};filename=realme-wireguard.conf" \
+            -F "caption=V8 Raw WireGuard
+
+Endpoint: ${PUBLIC_IP}:${WG_PORT}
+
+Import this file into the WireGuard Android app on the Realme.
+
+WARNING: This file contains a private key. Do not forward or publish it."
+
+          echo
+          echo "WireGuard .conf successfully sent to Telegram."
+
+      # ============================================================
+      # WAIT / MONITOR
+      # ============================================================
+
+      - name: Keep WireGuard alive and monitor handshake
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          DURATION="${{ inputs.duration }}"
+          TOTAL_SECONDS=$((DURATION * 60))
+
+          START="$(date +%s)"
+          NEXT_REPORT=0
+
+          echo "============================================================"
+          echo "RAW WIREGUARD EXIT NODE ACTIVE"
+          echo "============================================================"
+
+          echo
+          echo "Public endpoint:"
+          echo "${{ steps.publicip.outputs.public_ip }}:${WG_PORT}"
+
+          echo
+          echo "WireGuard server:"
+          echo "${WG_SERVER_IP}"
+
+          echo
+          echo "Realme client:"
+          echo "${WG_CLIENT_IP}"
+
+          while true; do
+
+            NOW="$(date +%s)"
+            ELAPSED=$((NOW - START))
+
+            if (( ELAPSED >= TOTAL_SECONDS )); then
+              break
+            fi
+
+            if (( ELAPSED >= NEXT_REPORT )); then
+
+              echo
+              echo "============================================================"
+              echo "WIREGUARD RUNTIME REPORT"
+              echo "Elapsed: ${ELAPSED}s"
+              echo "============================================================"
+
+              sudo wg show
+
+              echo
+              echo "Interface:"
+              ip -br addr show "$WG_INTERFACE"
+
+              echo
+              echo "Interface counters:"
+              ip -s link show "$WG_INTERFACE" || true
+
+              echo
+              echo "UDP listener:"
+              ss -u -l -n -p |
+                grep ":${WG_PORT}" ||
+                true
+
+              NEXT_REPORT=$((ELAPSED + 30))
+            fi
+
+            sleep 10
+
+          done
+
+      # ============================================================
+      # CLEANUP
+      # ============================================================
+
+      - name: Cleanup WireGuard
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          echo "============================================================"
+          echo "WIREGUARD CLEANUP"
+          echo "============================================================"
+
+          sudo wg-quick down "$WG_INTERFACE"
+
+          sudo rm -f \
+            /etc/wireguard/server_private.key \
+            /etc/wireguard/server_public.key \
+            /etc/wireguard/wg0.conf
+
+          rm -f \
+            /tmp/client_private.key \
+            /tmp/client_public.key \
+            /tmp/realme-wireguard.conf
+
+          echo "Cleanup completed."

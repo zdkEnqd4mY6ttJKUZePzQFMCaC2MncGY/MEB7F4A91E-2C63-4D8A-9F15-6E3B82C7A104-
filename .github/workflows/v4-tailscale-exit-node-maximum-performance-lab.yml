@@ -1,0 +1,389 @@
+name: V4 Tailscale Exit Node - Maximum Performance Lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "Runtime in minutes (1-335)"
+        required: false
+        default: "335"
+        type: string
+      loops:
+        description: "Remaining chained runs (blank = 4)"
+        required: false
+        default: ""
+        type: string
+
+concurrency:
+  group: tailscale-exit-node
+  cancel-in-progress: false
+
+# GH_PAT is intentionally retained for your existing chain-rotation mechanism.
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  vpn-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      TS_NODE: github-gigabit-vpn
+
+    steps:
+      - name: Validate required secrets
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -euo pipefail
+
+          [[ -n "$GH_PAT" && ${#GH_PAT} -ge 10 ]] || {
+            echo "::error::GH_PAT is missing or invalid."
+            exit 1
+          }
+
+          [[ -n "$TAILSCALE_AUTH_KEY" && ${#TAILSCALE_AUTH_KEY} -ge 6 ]] || {
+            echo "::error::TAILSCALE_AUTH_KEY is missing."
+            exit 1
+          }
+
+          echo "Required secrets are present."
+
+      - name: Inspect runner and network baseline
+        id: baseline
+        run: |
+          set -euo pipefail
+
+          echo "===== RUNNER ====="
+          echo "CPU: $(nproc)"
+          echo "RAM: $(free -h | awk '/^Mem:/ {print $2}')"
+          echo "Kernel: $(uname -r)"
+          echo "OS:"
+          . /etc/os-release
+          echo "${PRETTY_NAME}"
+
+          IFACE="$(ip -o route get 8.8.8.8 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+          [[ -n "$IFACE" ]] || {
+            echo "::error::Could not determine the default route interface."
+            exit 1
+          }
+
+          echo "IFACE=$IFACE" >> "$GITHUB_ENV"
+          echo "Interface: $IFACE"
+
+          echo
+          echo "===== NETWORK ====="
+          ip -br addr show "$IFACE"
+          ip route
+
+          echo
+          echo "===== OFFLOAD BEFORE ====="
+          sudo ethtool -k "$IFACE" 2>/dev/null | grep -E \
+            'generic-receive-offload|generic-segmentation-offload|tcp-segmentation-offload|rx-udp-gro-forwarding|rx-gro-list|tx-udp-segmentation' \
+            || true
+
+      - name: Tune Linux for high-throughput forwarding
+        run: |
+          set -euo pipefail
+
+          echo "Applying only performance settings relevant to forwarding."
+
+          sudo modprobe tcp_bbr 2>/dev/null || true
+
+          # BBR + fq is a good high-throughput baseline when supported.
+          sudo sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 || true
+          sudo sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1 || true
+
+          # Required for Linux exit-node forwarding.
+          sudo sysctl -w net.ipv4.ip_forward=1
+          sudo sysctl -w net.ipv6.conf.all.forwarding=1
+
+          # High-BDP socket buffers. These are ceilings, not bandwidth limits.
+          sudo sysctl -w net.core.rmem_max=67108864
+          sudo sysctl -w net.core.wmem_max=67108864
+          sudo sysctl -w net.core.rmem_default=33554432
+          sudo sysctl -w net.core.wmem_default=33554432
+          sudo sysctl -w net.ipv4.tcp_rmem="4096 87380 67108864"
+          sudo sysctl -w net.ipv4.tcp_wmem="4096 65536 67108864"
+
+          # Useful path/connection settings.
+          sudo sysctl -w net.ipv4.tcp_mtu_probing=1
+          sudo sysctl -w net.ipv4.tcp_fastopen=3
+          sudo sysctl -w net.core.netdev_max_backlog=100000
+
+          echo
+          echo "===== EFFECTIVE SETTINGS ====="
+          sysctl \
+            net.ipv4.ip_forward \
+            net.ipv6.conf.all.forwarding \
+            net.ipv4.tcp_congestion_control \
+            net.core.default_qdisc \
+            net.core.rmem_max \
+            net.core.wmem_max \
+            net.core.netdev_max_backlog
+
+      - name: Enable Tailscale UDP forwarding offloads
+        run: |
+          set -euo pipefail
+
+          # Tailscale recommends these for Linux 6.2+ exit nodes/subnet routers.
+          # They improve UDP forwarding throughput and are especially relevant to
+          # Tailscale's WireGuard transport.
+          if sudo ethtool -K "$IFACE" \
+              rx-udp-gro-forwarding on \
+              rx-gro-list off 2>/dev/null; then
+            echo "Tailscale UDP forwarding offloads enabled."
+          else
+            echo "::warning::UDP forwarding offload tuning was not supported by this runner."
+          fi
+
+          echo
+          echo "===== OFFLOAD AFTER ====="
+          sudo ethtool -k "$IFACE" 2>/dev/null | grep -E \
+            'generic-receive-offload|generic-segmentation-offload|tcp-segmentation-offload|rx-udp-gro-forwarding|rx-gro-list|tx-udp-segmentation' \
+            || true
+
+      - name: Install and authenticate Tailscale
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          set -euo pipefail
+
+          echo "Installing Tailscale..."
+          curl --fail --silent --show-error --location \
+            https://tailscale.com/install.sh | sh
+
+          echo "Starting Tailscale exit node..."
+          sudo tailscale up \
+            --authkey="$TAILSCALE_AUTH_KEY" \
+            --hostname="$TS_NODE" \
+            --advertise-exit-node \
+            --accept-routes \
+            --reset
+
+          TS_IP="$(sudo tailscale ip -4 | head -n 1)"
+          [[ -n "$TS_IP" ]] || {
+            echo "::error::Tailscale authenticated but did not return an IPv4 address."
+            exit 1
+          }
+
+          echo "TS_IP=$TS_IP" >> "$GITHUB_ENV"
+
+          echo "Tailscale IPv4: $TS_IP"
+          sudo tailscale status
+
+      - name: Verify exit-node configuration
+        run: |
+          set -euo pipefail
+
+          echo "===== TAILSCALE STATUS ====="
+          sudo tailscale status
+
+          echo
+          echo "===== TAILSCALE NETCHECK ====="
+          sudo tailscale netcheck || true
+
+          echo
+          echo "===== TAILSCALE PREFERENCES ====="
+          sudo tailscale debug prefs 2>/dev/null || true
+
+          echo
+          echo "===== TAILSCALE IP ====="
+          sudo tailscale ip -4
+
+          # Confirm the daemon is responsive.
+          sudo tailscale status >/dev/null
+
+          # Confirm forwarding is still enabled after Tailscale startup.
+          [[ "$(sysctl -n net.ipv4.ip_forward)" == "1" ]]
+          [[ "$(sysctl -n net.ipv6.conf.all.forwarding)" == "1" ]]
+
+          echo
+          echo "Exit-node baseline verification passed."
+
+      - name: Network path diagnostics
+        run: |
+          set -euo pipefail
+
+          echo "===== PATH DIAGNOSTICS ====="
+
+          if command -v resolvectl >/dev/null 2>&1; then
+            resolvectl status 2>/dev/null | head -n 80 || true
+          fi
+
+          echo
+          echo "Default route:"
+          ip route get 8.8.8.8
+
+          echo
+          echo "Tailscale peer/path state:"
+          sudo tailscale status --json 2>/dev/null | \
+            jq -r '
+              .Peer // {} |
+              to_entries[] |
+              [
+                .value.HostName,
+                (.value.TailscaleIPs[0] // "-"),
+                (.value.CurAddr // "-"),
+                (.value.CurAddr // "-" | if . == "" then "-" else "address-present" end)
+              ] | @tsv
+            ' 2>/dev/null || true
+
+          echo
+          echo "Note: direct-vs-relay performance depends on the actual peer path."
+          echo "The client-side Tailscale app/netcheck is the best place to confirm"
+          echo "whether your phone/PC has a direct UDP path to this runner."
+
+      - name: Send ready notification to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DURATION: ${{ github.event.inputs.duration || '335' }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$TELEGRAM_BOT_TOKEN" || -z "$TELEGRAM_CHAT_ID" ]]; then
+            echo "::notice::Telegram secrets are not configured; skipping notification."
+            exit 0
+          fi
+
+          message="🛡️ <b>High-Throughput Exit Node Ready</b>"$'\n'
+          message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+          message+="🚀 <b>Node:</b> <code>${TS_NODE}</code>"$'\n'
+          message+="🌐 <b>Tailscale IP:</b> <code>${TS_IP}</code>"$'\n'
+          message+="⚡ <b>Datapath:</b> <code>WireGuard + Linux kernel + UDP GRO</code>"$'\n'
+          message+="📈 <b>TCP:</b> <code>BBR/fq when supported</code>"$'\n'
+          message+="⏱️ <b>Runtime:</b> <code>${DURATION} min max</code>"$'\n'
+          message+="🔁 <b>Run:</b> <code>#${{ github.run_number }}</code>"$'\n'
+          message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+          message+="📲 Select <b>${TS_NODE}</b> as your Tailscale Exit Node."$'\n'
+          message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+          message+="⚡ <i>No software bandwidth limiter configured.</i>"
+
+          payload="$(jq -n \
+            --arg chat_id "$TELEGRAM_CHAT_ID" \
+            --arg text "$message" \
+            '{chat_id:$chat_id,text:$text,parse_mode:"HTML",disable_web_page_preview:true}')"
+
+          if curl --fail --silent --show-error --max-time 15 \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$payload" >/dev/null; then
+            echo "Telegram notification sent."
+          else
+            echo "::warning::Telegram notification failed."
+          fi
+
+      - name: Keep exit node alive
+        env:
+          DURATION: ${{ github.event.inputs.duration || '335' }}
+        run: |
+          set -euo pipefail
+
+          m="$DURATION"
+
+          if [[ ! "$m" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Invalid duration '$m'; using 335."
+            m=335
+          fi
+
+          (( m >= 1 )) || {
+            echo "::error::Duration must be at least 1 minute."
+            exit 1
+          }
+
+          (( m <= 335 )) || m=335
+
+          echo "Keeping exit node alive for up to ${m} minutes."
+
+          for ((i=1; i<=m; i++)); do
+            remaining=$((m-i))
+            pct=$((i*100/m))
+
+            echo "[$(date -u +'%Y-%m-%d %H:%M:%S UTC')] ${remaining} min remaining (${pct}% elapsed)"
+
+            # Fast daemon check.
+            if ! sudo tailscale status >/dev/null 2>&1; then
+              echo "::error::Tailscale daemon is unhealthy."
+              exit 1
+            fi
+
+            # Every 5 minutes, also inspect the interface/path.
+            if (( i % 5 == 0 )); then
+              echo "--- periodic network check ---"
+              sudo tailscale netcheck 2>/dev/null | head -n 40 || true
+              ip -s link show "$IFACE" | head -n 20 || true
+            fi
+
+            sleep 60
+          done
+
+      - name: Chain rotation
+        if: ${{ !cancelled() }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          LOOPS_INPUT: ${{ github.event.inputs.loops }}
+          REPOSITORY: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          loops="${LOOPS_INPUT:-4}"
+
+          if [[ ! "$loops" =~ ^[0-9]+$ ]]; then
+            echo "::warning::Invalid loop counter '$loops'; using 4."
+            loops=4
+          fi
+
+          if (( loops <= 1 )); then
+            echo "Chain complete."
+            exit 0
+          fi
+
+          [[ -n "$GH_PAT" && ${#GH_PAT} -ge 10 ]] || {
+            echo "::error::GH_PAT is missing; cannot dispatch next run."
+            exit 1
+          }
+
+          next=$((loops-1))
+
+          payload="$(jq -n \
+            --arg ref "$REF_NAME" \
+            --arg next "$next" \
+            '{ref:$ref,inputs:{loops:$next}}')"
+
+          response="$(curl --silent --show-error \
+            --connect-timeout 10 \
+            --max-time 30 \
+            -w $'\n%{http_code}' \
+            -X POST \
+            "https://api.github.com/repos/${REPOSITORY}/actions/workflows/v4-tailscale-exit-node-maximum-performance-lab.yml/dispatches" \
+            -H "Authorization: Bearer ${GH_PAT}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$payload")"
+
+          http_code="${response##*$'\n'}"
+          body="${response%$'\n'*}"
+
+          if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+            echo "Next iteration dispatched successfully: ${next}"
+          else
+            echo "::error::GitHub workflow dispatch failed: HTTP ${http_code}"
+            echo "$body"
+            exit 1
+          fi
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "Cleaning up Tailscale..."
+          sudo tailscale logout 2>/dev/null || true
+          sudo tailscale down 2>/dev/null || true

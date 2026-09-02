@@ -39,6 +39,9 @@ jobs:
 
       - name: Validate secrets and inputs
         shell: bash
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           set -euo pipefail
 
@@ -56,6 +59,8 @@ jobs:
             echo "duration must be between 1 and 335 minutes"
             exit 1
           fi
+
+          echo "Validation passed."
 
       # ============================================================
       # RUNNER INFORMATION
@@ -394,8 +399,6 @@ jobs:
           echo "ONLINE PEERS"
           echo "============================================================"
 
-          # Ubuntu GitHub-hosted runners include jq.
-          # Extract online peers and their Tailscale IPv4 addresses.
           mapfile -t PEERS < <(
             tailscale status --json |
               jq -r '
@@ -623,14 +626,15 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [[ -z "${GH_PAT:-}" ]]; then
+            echo "GH_PAT is not configured."
+            echo "Skipping workflow rotation."
+            exit 0
+          fi
+
           REPO="${GITHUB_REPOSITORY}"
           WORKFLOW="v6-tailscale-exit-node-maximum-performance-lab.yml"
           REF="${GITHUB_REF_NAME:-main}"
-
-          if [[ -z "${GH_PAT:-}" ]]; then
-            echo "GH_PAT is missing."
-            exit 1
-          fi
 
           echo "============================================================"
           echo "DISPATCHING NEXT V6 RUNNER"

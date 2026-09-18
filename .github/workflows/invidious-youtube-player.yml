@@ -49,70 +49,84 @@ jobs:
           git clone --depth=1 https://github.com/iv-org/invidious.git /tmp/invidious
           cd /tmp/invidious
 
-          echo "⚙️ Generating dynamic secrets for HMAC and Companion..."
-          HMAC_KEY=$(openssl rand -hex 16)
-          COMPANION_KEY=$(openssl rand -hex 16)
-          export HMAC_KEY COMPANION_KEY
+          echo "⚙️ Generating configuration and docker-compose.yml..."
+          sed 's/^          //' << 'PYEOF' > /tmp/setup_invidious.py
+          import os
+          import textwrap
 
-          echo "📄 Creating docker-compose.yml..."
-          cat << 'EOF' > docker-compose.yml
-          services:
-            invidious:
-              image: quay.io/invidious/invidious:latest
-              restart: unless-stopped
-              ports:
-                - "3000:3000"
-              environment:
-                INVIDIOUS_CONFIG: |
-                  db:
-                    dbname: invidious
-                    user: kemal
-                    password: kemal_password
-                    host: invidious-db
-                    port: 5432
-                  check_tables: true
-                  hmac_key: "${HMAC_KEY}"
-                  invidious_companion:
-                    - private_url: "http://companion:8282/companion"
-                      invidious_companion_key: "${COMPANION_KEY}"
-              depends_on:
-                invidious-db:
-                  condition: service_healthy
-                companion:
-                  condition: service_started
+          hmac_key = os.urandom(16).hex()
+          companion_key = os.urandom(16).hex()
 
-            companion:
-              image: quay.io/invidious/invidious-companion:latest
-              restart: unless-stopped
-              environment:
-                - SERVER_SECRET_KEY=${COMPANION_KEY}
-              volumes:
-                - companioncache:/var/tmp/youtubei.js:rw
+          config_yaml = textwrap.dedent(f"""\
+            db:
+              dbname: invidious
+              user: kemal
+              password: kemal_password
+              host: invidious-db
+              port: 5432
+              check_tables: true
 
-            invidious-db:
-              image: docker.io/library/postgres:14
-              restart: unless-stopped
-              environment:
-                POSTGRES_DB: invidious
-                POSTGRES_USER: kemal
-                POSTGRES_PASSWORD: kemal_password
-              volumes:
-                - ./config/sql:/config/sql:ro
-                - ./docker/init-invidious-db.sh:/docker-entrypoint-initdb.d/init-invidious-db.sh:ro
-                - postgresdata:/var/lib/postgresql/data
-              healthcheck:
-                test: ["CMD-SHELL", "pg_isready -U kemal -d invidious"]
-                interval: 5s
-                timeout: 5s
-                retries: 5
+            hmac_key: "{hmac_key}"
 
-          volumes:
-            postgresdata:
-            companioncache:
-          EOF
+            invidious_companion:
+              - private_url: "http://companion:8282/companion"
+                invidious_companion_key: "{companion_key}"
+          """)
 
-          # Remove leading spaces from heredoc to ensure clean yaml indentation
-          sed -i 's/^          //' docker-compose.yml
+          compose_yaml = textwrap.dedent(f"""\
+            services:
+              invidious:
+                image: quay.io/invidious/invidious:latest
+                restart: unless-stopped
+                ports:
+                  - "3000:3000"
+                volumes:
+                  - ./config/config.yml:/invidious/config/config.yml:ro
+                depends_on:
+                  invidious-db:
+                    condition: service_healthy
+                  companion:
+                    condition: service_started
+
+              companion:
+                image: quay.io/invidious/invidious-companion:latest
+                restart: unless-stopped
+                environment:
+                  - SERVER_SECRET_KEY={companion_key}
+                volumes:
+                  - companioncache:/var/tmp/youtubei.js:rw
+
+              invidious-db:
+                image: docker.io/library/postgres:14
+                restart: unless-stopped
+                environment:
+                  POSTGRES_DB: invidious
+                  POSTGRES_USER: kemal
+                  POSTGRES_PASSWORD: kemal_password
+                volumes:
+                  - ./config/sql:/config/sql:ro
+                  - ./docker/init-invidious-db.sh:/docker-entrypoint-initdb.d/init-invidious-db.sh:ro
+                  - postgresdata:/var/lib/postgresql/data
+                healthcheck:
+                  test: ["CMD-SHELL", "pg_isready -U kemal -d invidious"]
+                  interval: 5s
+                  timeout: 5s
+                  retries: 5
+
+            volumes:
+              postgresdata:
+              companioncache:
+          """)
+
+          with open("config/config.yml", "w", encoding="utf-8") as f:
+              f.write(config_yaml)
+
+          with open("docker-compose.yml", "w", encoding="utf-8") as f:
+              f.write(compose_yaml)
+
+          print("✅ Configuration and docker-compose.yml successfully generated!")
+          PYEOF
+          python3 /tmp/setup_invidious.py
 
           echo "🚀 Launching Invidious services with Docker Compose..."
           docker compose up -d

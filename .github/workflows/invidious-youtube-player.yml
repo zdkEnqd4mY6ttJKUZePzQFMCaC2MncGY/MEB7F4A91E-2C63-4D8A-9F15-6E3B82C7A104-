@@ -1,0 +1,285 @@
+name: Invidious YouTube Player (Ubuntu Loop) - by Redwanul Haque
+# Suggested filename: invidious-youtube-player.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+
+concurrency:
+  group: invidious-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  invidious:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      # ───────────────────────────────────────────────
+      # Step 1: Validate GitHub Token
+      # ───────────────────────────────────────────────
+      - name: 🔑 Validate GitHub Token
+        id: validate
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is not set! Go to repo Settings > Secrets > Actions and add GH_PAT."
+            exit 1
+          fi
+          echo "✅ GH_PAT secret is configured (${#token} chars)."
+
+      # ───────────────────────────────────────────────
+      # Step 2: Setup & Start Invidious Containers
+      # ───────────────────────────────────────────────
+      - name: 📺 Start Invidious & Database Containers
+        id: invidious-start
+        run: |
+          echo "📦 Cloning Invidious repository for database schemas and configs..."
+          git clone --depth=1 https://github.com/iv-org/invidious.git /tmp/invidious
+          cd /tmp/invidious
+
+          echo "⚙️ Generating dynamic secrets for HMAC and Companion..."
+          HMAC_KEY=$(openssl rand -hex 16)
+          COMPANION_KEY=$(openssl rand -hex 16)
+          export HMAC_KEY COMPANION_KEY
+
+          echo "📄 Creating docker-compose.yml..."
+          cat << 'EOF' > docker-compose.yml
+          services:
+            invidious:
+              image: quay.io/invidious/invidious:latest
+              restart: unless-stopped
+              ports:
+                - "3000:3000"
+              environment:
+                INVIDIOUS_CONFIG: |
+                  db:
+                    dbname: invidious
+                    user: kemal
+                    password: kemal_password
+                    host: invidious-db
+                    port: 5432
+                  check_tables: true
+                  hmac_key: "${HMAC_KEY}"
+                  invidious_companion:
+                    - private_url: "http://companion:8282/companion"
+                      invidious_companion_key: "${COMPANION_KEY}"
+              depends_on:
+                invidious-db:
+                  condition: service_healthy
+                companion:
+                  condition: service_started
+
+            companion:
+              image: quay.io/invidious/invidious-companion:latest
+              restart: unless-stopped
+              environment:
+                - SERVER_SECRET_KEY=${COMPANION_KEY}
+              volumes:
+                - companioncache:/var/tmp/youtubei.js:rw
+
+            invidious-db:
+              image: docker.io/library/postgres:14
+              restart: unless-stopped
+              environment:
+                POSTGRES_DB: invidious
+                POSTGRES_USER: kemal
+                POSTGRES_PASSWORD: kemal_password
+              volumes:
+                - ./config/sql:/config/sql:ro
+                - ./docker/init-invidious-db.sh:/docker-entrypoint-initdb.d/init-invidious-db.sh:ro
+                - postgresdata:/var/lib/postgresql/data
+              healthcheck:
+                test: ["CMD-SHELL", "pg_isready -U kemal -d invidious"]
+                interval: 5s
+                timeout: 5s
+                retries: 5
+
+          volumes:
+            postgresdata:
+            companioncache:
+          EOF
+
+          # Remove leading spaces from heredoc to ensure clean yaml indentation
+          sed -i 's/^          //' docker-compose.yml
+
+          echo "🚀 Launching Invidious services with Docker Compose..."
+          docker compose up -d
+
+          echo "⏳ Waiting for Invidious web UI on port 3000 to become responsive..."
+          ready=false
+          for i in {1..40}; do
+            if curl -s http://localhost:3000 > /dev/null 2>&1; then
+              ready=true
+              echo "✅ Invidious web server is active and responding on port 3000!"
+              break
+            fi
+            echo "Attempt ${i}: waiting for Invidious service..."
+            sleep 4
+          done
+
+          if [ "$ready" != "true" ]; then
+            echo "❌ Invidious failed to become responsive. Container logs:"
+            docker compose logs || true
+            exit 1
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 3: Install & Start Cloudflare Tunnel
+      # ───────────────────────────────────────────────
+      - name: 🌐 Setup Cloudflare Tunnel
+        id: cloudflare-tunnel
+        run: |
+          echo "⬇️ Downloading & installing cloudflared..."
+          curl -L -s --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          rm -f cloudflared.deb
+
+          echo "🚀 Launching Cloudflare Tunnel for http://localhost:3000 ..."
+          rm -f /tmp/cloudflared.log
+          cloudflared tunnel --url http://localhost:3000 --logfile /tmp/cloudflared.log > /dev/null 2>&1 &
+
+          echo "⏳ Waiting for Cloudflare Tunnel URL..."
+          CF_URL=""
+          for i in {1..30}; do
+            sleep 2
+            if [ -f /tmp/cloudflared.log ]; then
+              CF_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$CF_URL" ]; then
+                echo "✅ Found Cloudflare URL on attempt $i: $CF_URL"
+                break
+              fi
+            fi
+          done
+
+          if [ -n "$CF_URL" ]; then
+            echo ""
+            echo "================================================================="
+            echo "📺 INVIDIOUS WEB UI URL: $CF_URL"
+            echo "================================================================="
+            echo ""
+            echo "INVIDIOUS_URL=$CF_URL" >> $GITHUB_ENV
+          else
+            echo "⚠️ Cloudflare Tunnel URL could not be extracted within time limit."
+            if [ -f /tmp/cloudflared.log ]; then
+              echo "--- Cloudflare Log Content ---"
+              cat /tmp/cloudflared.log || true
+            fi
+            echo "INVIDIOUS_URL=Not Available" >> $GITHUB_ENV
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 4: Send Details to Telegram
+      # ───────────────────────────────────────────────
+      - name: 📲 Send Details to Telegram
+        run: |
+          botToken="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chatId="${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if [ -z "$botToken" ] || [ -z "$chatId" ]; then
+            echo "⚠️ Telegram secrets not set. Skipping notification."
+          else
+            message="📺 <b>Invidious YouTube Player Ready!</b>"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="🔗 Web UI URL: <code>${INVIDIOUS_URL}</code>"$'\n'
+            message+="🚫 Ad-Free • Privacy-Focused • No Google Account"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⏱️ Uptime: ~5h 50m"$'\n'
+            message+="🔁 Run: #${{ github.run_number }}"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⚡ <i>Powered by Redwanul Haque</i>"
+
+            payload=$(jq -n \
+              --arg chat_id "$chatId" \
+              --arg text "$message" \
+              --arg parse_mode "HTML" \
+              '{chat_id: $chat_id, text: $text, parse_mode: $parse_mode}')
+
+            curl -s -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$payload" > /dev/null || true
+            echo "✅ Telegram notification sent!"
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 5: Print Details & Keep Alive
+      # ───────────────────────────────────────────────
+      - name: 📢 Print Details & Keep Alive
+        run: |
+          echo ""
+          echo "================================================================="
+          echo "⚡ Powered by Redwanul Haque"
+          echo "-----------------------------------------------------------------"
+          echo "Invidious URL: ${INVIDIOUS_URL}"
+          echo "================================================================="
+          echo ""
+
+          m=350
+          for i in $(seq 1 $m); do
+            l=$((m - i))
+            pct=$((i * 100 / m))
+            echo "[$(date +'%H:%M:%S')] ⏱️ $l min remaining ($pct% elapsed)"
+            sleep 60
+          done
+
+      # ───────────────────────────────────────────────
+      # Step 6: Chain Rotation Engine
+      # ───────────────────────────────────────────────
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          inputLoops="${{ github.event.inputs.loops }}"
+          if [ -z "$inputLoops" ]; then
+            loops=4
+          else
+            loops=$inputLoops
+          fi
+
+          if [ "$loops" -le 1 ]; then
+            echo "🎯 Chain Finished Successfully. Total iterations completed."
+            exit 0
+          fi
+
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is missing. Cannot dispatch next iteration."
+            exit 1
+          fi
+
+          next=$((loops - 1))
+          echo "🔁 Dispatching next iteration: $next remaining..."
+
+          payload=$(jq -n \
+            --arg ref "${{ github.ref_name }}" \
+            --arg next "$next" \
+            '{ref: $ref, inputs: {loops: $next}}')
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/invidious-youtube-player.yml/dispatches" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "✅ Secured handoff executed to loop iteration: $next"
+          else
+            echo "⚠️ Chain dispatch returned HTTP status $http_code:"
+            echo "$body"
+            echo "💡 Tip: Make sure .github/workflows/invidious-youtube-player.yml is committed and pushed to your GitHub repository's default branch."
+          fi

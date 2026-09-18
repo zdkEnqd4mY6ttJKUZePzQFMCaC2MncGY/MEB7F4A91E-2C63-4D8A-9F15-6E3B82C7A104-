@@ -55,7 +55,7 @@ jobs:
           import textwrap
 
           hmac_key = os.urandom(16).hex()
-          companion_key = os.urandom(16).hex()
+          companion_key = os.urandom(8).hex()  # Must be exactly 16 characters
 
           config_yaml = textwrap.dedent(f"""\
             db:
@@ -70,7 +70,8 @@ jobs:
 
             invidious_companion:
               - private_url: "http://companion:8282/companion"
-                invidious_companion_key: "{companion_key}"
+
+            invidious_companion_key: "{companion_key}"
           """)
 
           compose_yaml = textwrap.dedent(f"""\

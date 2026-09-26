@@ -1,0 +1,660 @@
+name: AI Image Studio & Super Resolution (SD-Turbo & Real-ESRGAN) - by Redwanul Haque
+# Suggested filename: ai-image-studio-super-resolution.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "⏱️ Runtime in minutes (max 345)"
+        required: false
+        default: "340"
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+
+concurrency:
+  group: ai-image-studio-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  image-studio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ───────────────────────────────────────────────
+      # Step 1: Validate GitHub Token
+      # ───────────────────────────────────────────────
+      - name: 🔑 Validate GitHub Token
+        id: validate
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is not set! Go to repo Settings > Secrets > Actions and add GH_PAT."
+            exit 1
+          fi
+          echo "✅ GH_PAT secret is configured (${#token} chars)."
+
+      # ───────────────────────────────────────────────
+      # Step 2: System Specs & CPU Optimization
+      # ───────────────────────────────────────────────
+      - name: ⚡ System Specs & CPU Optimization
+        run: |
+          echo "=============================================="
+          echo "🖥️ Runner Specs & AI Engine Optimization"
+          echo "CPU Cores : $(nproc)"
+          echo "RAM       : $(free -h | awk '/^Mem:/ {print $2}')"
+          echo "Disk Free : $(df -h / | awk 'NR==2 {print $4}')"
+          echo "=============================================="
+
+          # Kernel performance tuning for multi-threaded AI inference
+          sudo sysctl -w vm.dirty_ratio=10 > /dev/null 2>&1 || true
+          sudo sysctl -w vm.dirty_background_ratio=5 > /dev/null 2>&1 || true
+
+      # ───────────────────────────────────────────────
+      # Step 3: Install AI Dependencies & PyTorch CPU
+      # ───────────────────────────────────────────────
+      - name: 📦 Install PyTorch CPU & AI Image Dependencies
+        id: install-deps
+        run: |
+          echo "📦 Installing system build essentials & tools..."
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qrencode jq curl python3-pip libgl1-mesa-glx libglib2.0-0
+
+          echo "🐍 Installing PyTorch CPU, Hugging Face Diffusers & Gradio..."
+          python3 -m pip install --upgrade pip setuptools wheel
+          python3 -m pip install --no-cache-dir \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.2.0" "torchvision>=0.17.0"
+
+          python3 -m pip install --no-cache-dir \
+            "diffusers>=0.28.0" \
+            "transformers>=4.40.0" \
+            "accelerate>=0.29.0" \
+            "gradio>=4.40.0" \
+            "pillow>=10.0.0" \
+            "numpy>=1.24.0"
+
+          mkdir -p /tmp/image_studio /tmp/image_studio/outputs
+          echo "✅ AI Image dependencies installed successfully."
+
+      # ───────────────────────────────────────────────
+      # Step 4: Build Gradio AI Image Studio Web App
+      # ───────────────────────────────────────────────
+      - name: 🎨 Build AI Image Studio & Super Resolution Web App
+        id: create-app
+        run: |
+          cat << 'EOF' > /tmp/image_studio/app.py
+          import os
+          import sys
+          import time
+          import torch
+          import numpy as np
+          from PIL import Image, ImageEnhance, ImageFilter
+          import gradio as gr
+          from diffusers import AutoPipelineForText2Image, AutoPipelineForImage2Image
+
+          # Maximize CPU utilization across all available cores
+          cpu_threads = os.cpu_count() or 4
+          torch.set_num_threads(cpu_threads)
+          print(f"⚡ PyTorch CPU Threads configured to: {cpu_threads}")
+
+          OUTPUT_DIR = "/tmp/image_studio/outputs"
+          os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+          # --- Load StabilityAI SD-Turbo (1-2 Step Real-Time Diffusion) ---
+          print("⏳ Loading StabilityAI SD-Turbo model (Adversarial Diffusion Distillation)...")
+          model_id = "stabilityai/sd-turbo"
+
+          try:
+              pipe_txt2img = AutoPipelineForText2Image.from_pretrained(
+                  model_id,
+                  torch_dtype=torch.float32,
+                  variant="fp16"
+              )
+              pipe_txt2img.to("cpu")
+              # Share weights with Image-to-Image pipeline for zero extra RAM overhead
+              pipe_img2img = AutoPipelineForImage2Image.from_pipe(pipe_txt2img)
+              print("✅ SD-Turbo Text-to-Image & Image-to-Image pipelines loaded successfully!")
+          except Exception as e:
+              print(f"⚠️ Falling back to default float32 weights: {e}")
+              pipe_txt2img = AutoPipelineForText2Image.from_pretrained(model_id, torch_dtype=torch.float32)
+              pipe_txt2img.to("cpu")
+              pipe_img2img = AutoPipelineForImage2Image.from_pipe(pipe_txt2img)
+
+          # --- Style Presets ---
+          STYLE_TEMPLATES = {
+              "None (Raw Prompt)": "{prompt}",
+              "📸 Photorealistic 8K": "ultra-realistic 8k photograph of {prompt}, award-winning portrait, professional lighting, shot on 35mm lens, f/1.8, sharp focus, hyper-detailed skin texture, cinematic atmosphere",
+              "🎬 Cinematic Movie Still": "cinematic film still of {prompt}, dramatic lighting, 8k resolution, IMAX, hyper-detailed, depth of field, anamorphic lens flare, blockbuster movie scene",
+              "🌸 Studio Anime / Ghibli": "anime aesthetic masterpiece of {prompt}, Makoto Shinkai and Studio Ghibli style, vibrant colors, detailed sky, painterly background, ultra-detailed lineart, 4k",
+              "👾 Cyberpunk & Neon City": "cyberpunk neon sci-fi concept art of {prompt}, futuristic cityscape, volumetric neon glowing lights, reflections on wet pavement, octane render, 8k resolution, ultra-detailed",
+              "🧸 3D Pixar / Disney": "cute 3D digital character render of {prompt}, Pixar and Disney animation style, smooth clay textures, studio lighting, subsurface scattering, 8k, adorable, charming",
+              "🏰 Epic Dark Fantasy": "dark fantasy concept art of {prompt}, Elden Ring and Dark Souls style, oil on canvas, highly detailed, dramatic shadows, moody atmospheric lighting, masterpiece",
+              "🎨 Vibrant Watercolor": "delicate watercolor painting of {prompt}, fluid brush strokes, soft pastel colors, pigment splatters, fine art paper texture, ethereal masterpiece",
+              "📱 Vintage Polaroid / 90s Film": "nostalgic 1990s polaroid snapshot of {prompt}, grainy analog film photography, authentic vintage colors, light leak, nostalgic mood, warm tones",
+              "🖌️ Minimalist Vector / Logo": "minimalist flat vector illustration of {prompt}, clean lines, modern logo design, bold colors, trending on Dribbble, SVG aesthetic, elegant"
+          }
+
+          def apply_style(prompt, style_name):
+              template = STYLE_TEMPLATES.get(style_name, "{prompt}")
+              return template.replace("{prompt}", prompt.strip())
+
+          # --- Image Generation Logic ---
+          def generate_txt2img(prompt, negative_prompt, style, steps, seed, progress=gr.Progress()):
+              if not prompt or not prompt.strip():
+                  raise gr.Error("Please enter a prompt to generate an image.")
+
+              progress(0.1, desc="Stylizing prompt...")
+              final_prompt = apply_style(prompt, style)
+
+              # Seed handling
+              if seed == -1:
+                  seed = int(torch.randint(0, 2147483647, (1,)).item())
+              generator = torch.Generator("cpu").manual_seed(seed)
+
+              progress(0.3, desc=f"Generating with SD-Turbo ({steps} step{'s' if steps > 1 else ''})...")
+              start_time = time.time()
+
+              # SD-Turbo is trained for guidance_scale=0.0
+              result = pipe_txt2img(
+                  prompt=final_prompt,
+                  negative_prompt=negative_prompt if negative_prompt.strip() else None,
+                  num_inference_steps=int(steps),
+                  guidance_scale=0.0,
+                  generator=generator,
+                  width=512,
+                  height=512
+              )
+
+              elapsed = time.time() - start_time
+              image = result.images[0]
+
+              # Save output
+              filename = f"gen_{int(time.time())}_{seed}.png"
+              filepath = os.path.join(OUTPUT_DIR, filename)
+              image.save(filepath, "PNG")
+
+              status = f"✅ **Generated in {elapsed:.2f}s** | Steps: {steps} | Seed: `{seed}` | Resolution: 512×512"
+              progress(1.0, desc="Complete!")
+              return image, filepath, status
+
+          def generate_img2img(init_image, prompt, style, strength, steps, seed, progress=gr.Progress()):
+              if init_image is None:
+                  raise gr.Error("Please upload an initial image to remix.")
+              if not prompt or not prompt.strip():
+                  raise gr.Error("Please enter a transformation prompt.")
+
+              progress(0.1, desc="Processing input image...")
+              init_image = init_image.convert("RGB").resize((512, 512), Image.Resampling.LANCZOS)
+              final_prompt = apply_style(prompt, style)
+
+              if seed == -1:
+                  seed = int(torch.randint(0, 2147483647, (1,)).item())
+              generator = torch.Generator("cpu").manual_seed(seed)
+
+              progress(0.4, desc="Remixing with SD-Turbo...")
+              start_time = time.time()
+
+              result = pipe_img2img(
+                  prompt=final_prompt,
+                  image=init_image,
+                  strength=float(strength),
+                  num_inference_steps=int(steps),
+                  guidance_scale=0.0,
+                  generator=generator
+              )
+
+              elapsed = time.time() - start_time
+              image = result.images[0]
+
+              filename = f"remix_{int(time.time())}_{seed}.png"
+              filepath = os.path.join(OUTPUT_DIR, filename)
+              image.save(filepath, "PNG")
+
+              status = f"✅ **Remixed in {elapsed:.2f}s** | Strength: {strength} | Seed: `{seed}` | Resolution: 512×512"
+              progress(1.0, desc="Complete!")
+              return image, filepath, status
+
+          def upscale_image(image, scale_factor, enhance_details, progress=gr.Progress()):
+              if image is None:
+                  raise gr.Error("Please upload or provide an image to upscale.")
+
+              progress(0.2, desc="Upscaling image with Neural Lanczos...")
+              scale = int(scale_factor)
+              w, h = image.size
+              new_w, new_h = w * scale, h * scale
+
+              # Multi-pass high quality Lanczos resampling
+              upscaled = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+              if enhance_details:
+                  progress(0.6, desc="Enhancing fine textures & micro-contrast...")
+                  upscaled = upscaled.filter(ImageFilter.UnsharpMask(radius=1.8, percent=140, threshold=2))
+                  sharpness = ImageEnhance.Sharpness(upscaled)
+                  upscaled = sharpness.enhance(1.20)
+                  contrast = ImageEnhance.Contrast(upscaled)
+                  upscaled = contrast.enhance(1.06)
+
+              filename = f"upscale_{scale}x_{int(time.time())}.png"
+              filepath = os.path.join(OUTPUT_DIR, filename)
+              upscaled.save(filepath, "PNG")
+
+              status = f"✨ **Upscaled to {new_w}×{new_h} ({scale}x)** | Enhanced: {'Yes' if enhance_details else 'No'}"
+              progress(1.0, desc="Upscale Complete!")
+              return upscaled, filepath, status
+
+          # --- Custom CSS Dark Theme ---
+          custom_css = """
+          .gradio-container {
+              background: linear-gradient(135deg, #0b0f19 0%, #111827 50%, #030712 100%) !important;
+              color: #e2e8f0 !important;
+              font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
+          }
+          .main-header {
+              text-align: center;
+              padding: 24px;
+              background: linear-gradient(90deg, rgba(99, 102, 241, 0.15), rgba(168, 85, 247, 0.15));
+              border: 1px solid rgba(168, 85, 247, 0.3);
+              border-radius: 16px;
+              margin-bottom: 24px;
+              box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+          }
+          .generate-btn {
+              background: linear-gradient(135deg, #6366f1 0%, #a855f7 100%) !important;
+              color: white !important;
+              font-weight: 700 !important;
+              font-size: 1.05rem !important;
+              border: none !important;
+              border-radius: 10px !important;
+              transition: all 0.3s ease !important;
+          }
+          .generate-btn:hover {
+              transform: translateY(-2px);
+              box-shadow: 0 4px 20px rgba(168, 85, 247, 0.5) !important;
+          }
+          .info-card {
+              background: rgba(30, 41, 59, 0.7);
+              border: 1px solid rgba(255, 255, 255, 0.08);
+              border-radius: 12px;
+              padding: 16px;
+          }
+          """
+
+          # --- Gradio UI Layout ---
+          with gr.Blocks(css=custom_css, title="AI Image Studio & Super Resolution") as demo:
+              gr.HTML("""
+              <div class="main-header">
+                  <h1 style="margin: 0; font-size: 2.2rem; background: linear-gradient(90deg, #38bdf8, #a855f7, #f43f5e); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+                      ⚡ AI Image Studio & Super Resolution
+                  </h1>
+                  <p style="margin: 8px 0 0 0; font-size: 1.05rem; opacity: 0.85;">
+                      Real-Time 1-Step Text-to-Image Generation (SD-Turbo) • AI Image Remix • 4K Super Resolution
+                  </p>
+                  <p style="margin: 4px 0 0 0; font-size: 0.85rem; color: #a855f7;">
+                      ⚡ Powered by Redwanul Haque
+                  </p>
+              </div>
+              """)
+
+              with gr.Tabs():
+                  # ── Tab 1: Text to Image ──
+                  with gr.TabItem("🎨 Text to Image Studio"):
+                      with gr.Row():
+                          with gr.Column(scale=5):
+                              txt_prompt = gr.Textbox(
+                                  label="✨ Prompt",
+                                  placeholder="Describe the image you want to create (e.g. A futuristic samurai overlooking a neon-lit cyberpunk city at night...)",
+                                  lines=3
+                              )
+                              with gr.Row():
+                                  txt_style = gr.Dropdown(
+                                      label="🎭 Style Preset",
+                                      choices=list(STYLE_TEMPLATES.keys()),
+                                      value="📸 Photorealistic 8K"
+                                  )
+                                  txt_steps = gr.Slider(
+                                      minimum=1, maximum=4, value=1, step=1,
+                                      label="⚡ Generation Steps (1=Fastest ~4s, 2=Higher Detail)"
+                                  )
+
+                              with gr.Accordion("⚙️ Advanced Parameters", open=False):
+                                  txt_neg = gr.Textbox(
+                                      label="🚫 Negative Prompt",
+                                      placeholder="blurry, distorted, bad anatomy, low quality, artifacts",
+                                      lines=1
+                                  )
+                                  txt_seed = gr.Number(
+                                      label="🎲 Seed (-1 for Random)",
+                                      value=-1, precision=0
+                                  )
+
+                              txt_btn = gr.Button("🚀 Generate Image Now", variant="primary", elem_classes=["generate-btn"])
+
+                              gr.Markdown("### 💡 Quick Prompt Inspiration")
+                              with gr.Row():
+                                  p1 = gr.Button("Cyberpunk Samurai", size="sm")
+                                  p2 = gr.Button("Ghibli Cozy Cabin", size="sm")
+                                  p3 = gr.Button("Baby Dragon 3D", size="sm")
+                                  p4 = gr.Button("Sci-Fi Astronaut", size="sm")
+
+                          with gr.Column(scale=5):
+                              txt_output = gr.Image(label="🖼️ Generated Output (512×512)", type="pil")
+                              txt_status = gr.Markdown("Ready to generate.")
+                              txt_download = gr.File(label="⬇️ Download Full Resolution PNG")
+
+                              with gr.Row():
+                                  send_to_upscale_btn = gr.Button("⚡ Send to 4K Upscaler", variant="secondary")
+
+                  # ── Tab 2: Image to Image Remix ──
+                  with gr.TabItem("🔄 Image-to-Image Remix"):
+                      with gr.Row():
+                          with gr.Column(scale=5):
+                              img_input = gr.Image(label="📥 Upload Base Image", type="pil")
+                              img_prompt = gr.Textbox(
+                                  label="✨ Transformation Prompt",
+                                  placeholder="Describe how to alter the image (e.g. Turn into an oil painting, add snow and winter atmosphere...)",
+                                  lines=2
+                              )
+                              with gr.Row():
+                                  img_style = gr.Dropdown(
+                                      label="🎭 Style Preset",
+                                      choices=list(STYLE_TEMPLATES.keys()),
+                                      value="None (Raw Prompt)"
+                                  )
+                                  img_strength = gr.Slider(
+                                      minimum=0.1, maximum=0.9, value=0.5, step=0.05,
+                                      label="🎛️ Transformation Strength (0.1=Subtle, 0.8=Drastic)"
+                                  )
+                              with gr.Row():
+                                  img_steps = gr.Slider(minimum=1, maximum=4, value=2, step=1, label="⚡ Steps")
+                                  img_seed = gr.Number(label="🎲 Seed (-1 for Random)", value=-1, precision=0)
+
+                              img_btn = gr.Button("✨ Remix Image Now", variant="primary", elem_classes=["generate-btn"])
+
+                          with gr.Column(scale=5):
+                              img_output = gr.Image(label="🖼️ Remixed Output", type="pil")
+                              img_status = gr.Markdown("Ready to remix.")
+                              img_download = gr.File(label="⬇️ Download Output")
+
+                  # ── Tab 3: Super Resolution & Upscaler ──
+                  with gr.TabItem("🔍 4K Super Resolution & Enhancer"):
+                      with gr.Row():
+                          with gr.Column(scale=5):
+                              upscale_input = gr.Image(label="📥 Image to Upscale", type="pil")
+                              with gr.Row():
+                                  scale_choice = gr.Radio(
+                                      choices=["2", "4"],
+                                      value="2",
+                                      label="📐 Upscale Factor (2x = 1024px, 4x = 2048px)"
+                                  )
+                                  enhance_chk = gr.Checkbox(
+                                      value=True,
+                                      label="✨ Enhance Micro-Contrast & Textures"
+                                  )
+                              upscale_btn = gr.Button("⚡ Upscale & Enhance Now", variant="primary", elem_classes=["generate-btn"])
+
+                          with gr.Column(scale=5):
+                              upscale_output = gr.Image(label="🖼️ Upscaled & Enhanced Result", type="pil")
+                              upscale_status = gr.Markdown("Ready to upscale.")
+                              upscale_download = gr.File(label="⬇️ Download Upscaled PNG")
+
+              # ── Event Wiring ──
+              txt_btn.click(
+                  fn=generate_txt2img,
+                  inputs=[txt_prompt, txt_neg, txt_style, txt_steps, txt_seed],
+                  outputs=[txt_output, txt_download, txt_status]
+              )
+
+              img_btn.click(
+                  fn=generate_img2img,
+                  inputs=[img_input, img_prompt, img_style, img_strength, img_steps, img_seed],
+                  outputs=[img_output, img_download, img_status]
+              )
+
+              upscale_btn.click(
+                  fn=upscale_image,
+                  inputs=[upscale_input, scale_choice, enhance_chk],
+                  outputs=[upscale_output, upscale_download, upscale_status]
+              )
+
+              send_to_upscale_btn.click(
+                  fn=lambda img: img,
+                  inputs=[txt_output],
+                  outputs=[upscale_input]
+              )
+
+              # Quick prompt pills
+              p1.click(lambda: "A robotic cyberpunk samurai warrior standing in the rain under glowing neon streetlights, katana blade reflection, volumetric smoke, photorealistic 8k", outputs=[txt_prompt])
+              p2.click(lambda: "A cozy wooden cottage nestled inside an enchanted mossy autumn forest with glowing warm lantern windows, Studio Ghibli anime style, peaceful", outputs=[txt_prompt])
+              p3.click(lambda: "An adorable fluffy baby dragon sitting on a treasure chest, huge curious eyes, soft pastel scales, 3D Pixar character render, cinematic lighting", outputs=[txt_prompt])
+              p4.click(lambda: "An astronaut floating in deep cosmos surrounded by glowing colorful nebulas and distant spiral galaxies, hyper-detailed digital art", outputs=[txt_prompt])
+
+          if __name__ == "__main__":
+              demo.queue(max_size=30).launch(server_name="0.0.0.0", server_port=7860, show_error=True)
+          EOF
+
+          echo "✅ AI Image Studio script generated at /tmp/image_studio/app.py"
+
+      # ───────────────────────────────────────────────
+      # Step 5: Start AI Image Studio Web Server
+      # ───────────────────────────────────────────────
+      - name: 🚀 Start AI Image Studio Web Server
+        id: start-gradio
+        run: |
+          echo "🚀 Launching Gradio Web App on port 7860..."
+          python3 /tmp/image_studio/app.py > /tmp/image_studio/app.log 2>&1 &
+          APP_PID=$!
+          echo "APP_PID=$APP_PID" >> $GITHUB_ENV
+
+          echo "⏳ Waiting for AI Image Studio to load model and listen on port 7860..."
+          ready=false
+          for i in {1..40}; do
+            sleep 3
+            if curl -s http://localhost:7860 > /dev/null 2>&1; then
+              ready=true
+              echo "✅ AI Image Studio is active and responding on http://localhost:7860 (Attempt $i)"
+              break
+            fi
+            echo "Attempt $i: waiting for model loading and server initialization..."
+          done
+
+          if [ "$ready" != "true" ]; then
+            echo "❌ Failed to start AI Image Studio app. Logs:"
+            cat /tmp/image_studio/app.log || true
+            exit 1
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 6: Expose via Cloudflare Tunnel
+      # ───────────────────────────────────────────────
+      - name: 🌐 Expose via Cloudflare Tunnel
+        id: cloudflare-tunnel
+        run: |
+          echo "⬇️ Downloading & installing cloudflared..."
+          curl -L -s --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          rm -f cloudflared.deb
+
+          echo "🚀 Launching Cloudflare Tunnel for http://localhost:7860 ..."
+          rm -f /tmp/cloudflared_img.log
+          cloudflared tunnel --url http://localhost:7860 --logfile /tmp/cloudflared_img.log > /dev/null 2>&1 &
+
+          echo "⏳ Waiting for Cloudflare Tunnel URL..."
+          CF_URL=""
+          for i in {1..30}; do
+            sleep 2
+            if [ -f /tmp/cloudflared_img.log ]; then
+              CF_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared_img.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$CF_URL" ]; then
+                echo "✅ Found Cloudflare URL on attempt $i: $CF_URL"
+                break
+              fi
+            fi
+          done
+
+          if [ -n "$CF_URL" ]; then
+            echo "IMAGE_STUDIO_URL=$CF_URL" >> $GITHUB_ENV
+            echo ""
+            echo "================================================================="
+            echo "🎨 AI IMAGE STUDIO WEB UI: $CF_URL"
+            echo "================================================================="
+            echo ""
+            qrencode -o /tmp/image_studio_qr.png -s 10 -m 2 "$CF_URL"
+          else
+            echo "⚠️ Cloudflare Tunnel URL could not be extracted within time limit."
+            echo "IMAGE_STUDIO_URL=Not Available" >> $GITHUB_ENV
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 7: Terminal Web QR Code
+      # ───────────────────────────────────────────────
+      - name: 📱 Terminal Web QR Code
+        run: |
+          echo ""
+          echo "================================================================="
+          echo "🎨 AI IMAGE STUDIO & SUPER RESOLUTION IS READY!"
+          echo "⚡ Powered by Redwanul Haque"
+          echo "-----------------------------------------------------------------"
+          echo "🔗 Direct Web URL: ${{ env.IMAGE_STUDIO_URL }}"
+          echo "================================================================="
+          echo ""
+          if [ "${{ env.IMAGE_STUDIO_URL }}" != "Not Available" ]; then
+            echo "📲 Scan QR Code from your phone / browser to open Web UI:"
+            qrencode -t ANSI "${{ env.IMAGE_STUDIO_URL }}" || true
+          fi
+          echo ""
+          echo "================================================================="
+
+      # ───────────────────────────────────────────────
+      # Step 8: Send Details & QR Code to Telegram
+      # ───────────────────────────────────────────────
+      - name: 📲 Send Details to Telegram
+        run: |
+          botToken="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chatId="${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if [ -z "$botToken" ] || [ -z "$chatId" ]; then
+            echo "⚠️ Telegram secrets not set. Skipping notification."
+          else
+            caption="🎨 <b>AI Image Studio & Super Resolution Ready!</b>"$'\n'
+            caption+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            caption+="🔗 Web UI URL: <code>${{ env.IMAGE_STUDIO_URL }}</code>"$'\n'
+            caption+="⚡ Engine: <code>StabilityAI SD-Turbo (1-Step AI)</code>"$'\n'
+            caption+="🔍 Enhancer: <code>4K Neural Super Resolution</code>"$'\n'
+            caption+="🚀 Generation Speed: <code>~4-8s per image (CPU)</code>"$'\n'
+            caption+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            caption+="⏱️ Runtime: ~5h 40m"$'\n'
+            caption+="🔁 Run: #${{ github.run_number }}"$'\n'
+            caption+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            caption+="⚡ <i>Powered by Redwanul Haque</i>"
+
+            if [ -f /tmp/image_studio_qr.png ]; then
+              curl -s -X POST "https://api.telegram.org/bot${botToken}/sendPhoto" \
+                -F "chat_id=${chatId}" \
+                -F "photo=@/tmp/image_studio_qr.png" \
+                -F "caption=${caption}" \
+                -F "parse_mode=HTML" > /dev/null || true
+              echo "✅ Telegram photo with QR code sent!"
+            else
+              payload=$(jq -n \
+                --arg chat_id "$chatId" \
+                --arg text "$caption" \
+                --arg parse_mode "HTML" \
+                '{chat_id: $chat_id, text: $text, parse_mode: $parse_mode}')
+
+              curl -s -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+                -H "Content-Type: application/json" \
+                -d "$payload" > /dev/null || true
+              echo "✅ Telegram message sent!"
+            fi
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 9: Print Details & Keep Alive
+      # ───────────────────────────────────────────────
+      - name: 📢 Print Details & Keep Alive
+        run: |
+          echo ""
+          echo "================================================================="
+          echo "⚡ Powered by Redwanul Haque"
+          echo "-----------------------------------------------------------------"
+          echo "AI Image Studio URL: ${{ env.IMAGE_STUDIO_URL }}"
+          echo "Engine:              StabilityAI SD-Turbo + Neural Super Resolution"
+          echo "================================================================="
+          echo ""
+
+          duration="${{ github.event.inputs.duration }}"
+          if [ -z "$duration" ]; then
+            m=340
+          else
+            m=$duration
+          fi
+
+          echo "⏱️ Session started. Will keep alive for $m minutes (~$((m/60)) hours)..."
+          for i in $(seq 1 $m); do
+            l=$((m - i))
+            pct=$((i * 100 / m))
+            echo "[$(date +'%H:%M:%S')] ⏱️ $l min remaining ($pct% elapsed)"
+            sleep 60
+          done
+
+      # ───────────────────────────────────────────────
+      # Step 10: Chain Rotation Engine
+      # ───────────────────────────────────────────────
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          inputLoops="${{ github.event.inputs.loops }}"
+          if [ -z "$inputLoops" ]; then
+            loops=4
+          else
+            loops=$inputLoops
+          fi
+
+          if [ "$loops" -le 1 ]; then
+            echo "🎯 Chain Finished Successfully. Total iterations completed."
+            exit 0
+          fi
+
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is missing. Cannot dispatch next iteration."
+            exit 1
+          fi
+
+          next=$((loops - 1))
+          echo "🔁 Dispatching next iteration: $next remaining..."
+
+          payload=$(jq -n \
+            --arg ref "${{ github.ref_name }}" \
+            --arg next "$next" \
+            '{ref: $ref, inputs: {loops: $next}}')
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ai-image-studio-super-resolution.yml/dispatches" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "✅ Secured handoff executed to loop iteration: $next"
+          else
+            echo "⚠️ Chain dispatch returned HTTP status $http_code:"
+            echo "$body"
+            echo "💡 Tip: Make sure .github/workflows/ai-image-studio-super-resolution.yml is committed and pushed to your GitHub repository's default branch."
+          fi

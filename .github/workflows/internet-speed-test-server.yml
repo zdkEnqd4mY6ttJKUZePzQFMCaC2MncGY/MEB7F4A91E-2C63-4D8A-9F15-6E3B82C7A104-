@@ -1,0 +1,293 @@
+name: Internet Speed Test Server (Ubuntu Loop) - by Redwanul Haque
+# Suggested filename: internet-speed-test-server.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: "⚡ Select Speed Test Engine"
+        required: true
+        default: "openspeedtest"
+        type: choice
+        options:
+          - "openspeedtest"
+          - "librespeed"
+      loops:
+        description: "🔄 Loop Counter (leave blank, auto-managed by the system)"
+        required: false
+        default: ""
+
+concurrency:
+  group: speedtest-singleton
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  speedtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      # ───────────────────────────────────────────────
+      # Step 1: Validate GitHub Token
+      # ───────────────────────────────────────────────
+      - name: 🔑 Validate GitHub Token
+        id: validate
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is not set! Go to repo Settings > Secrets > Actions and add GH_PAT."
+            exit 1
+          fi
+          echo "✅ GH_PAT secret is configured (${#token} chars)."
+
+      # ───────────────────────────────────────────────
+      # Step 2: Benchmark Runner Network Speed
+      # ───────────────────────────────────────────────
+      - name: ⚡ Benchmark Runner Network Speed
+        id: runner-benchmark
+        run: |
+          echo "================================================================="
+          echo "⚡ Benchmarking GitHub Actions Runner Internet Connection..."
+          echo "================================================================="
+
+          # Install speedtest-cli for quick CLI benchmarking
+          pip install --no-cache-dir --quiet speedtest-cli > /dev/null 2>&1 || true
+
+          SPEED_OUTPUT=$(timeout 45s speedtest-cli --simple 2>/dev/null || echo "Ping: N/A\nDownload: N/A\nUpload: N/A")
+          echo "$SPEED_OUTPUT"
+
+          RUNNER_PING=$(echo "$SPEED_OUTPUT" | grep -i "Ping:" | cut -d':' -f2 | xargs || echo "N/A")
+          RUNNER_DL=$(echo "$SPEED_OUTPUT" | grep -i "Download:" | cut -d':' -f2 | xargs || echo "N/A")
+          RUNNER_UL=$(echo "$SPEED_OUTPUT" | grep -i "Upload:" | cut -d':' -f2 | xargs || echo "N/A")
+
+          echo "RUNNER_PING=${RUNNER_PING:-N/A}" >> $GITHUB_ENV
+          echo "RUNNER_DL=${RUNNER_DL:-N/A}" >> $GITHUB_ENV
+          echo "RUNNER_UL=${RUNNER_UL:-N/A}" >> $GITHUB_ENV
+          echo "✅ Runner speed benchmark completed."
+
+      # ───────────────────────────────────────────────
+      # Step 3: Start Speed Test Container
+      # ───────────────────────────────────────────────
+      - name: 🚀 Start Speed Test Container
+        id: speedtest-start
+        run: |
+          selected_engine="${{ github.event.inputs.engine }}"
+          if [ -z "$selected_engine" ]; then
+            selected_engine="openspeedtest"
+          fi
+          echo "SELECTED_ENGINE=$selected_engine" >> $GITHUB_ENV
+
+          echo "📦 Starting Speed Test engine: $selected_engine on port 3000..."
+
+          if [ "$selected_engine" == "librespeed" ]; then
+            echo "ℹ️ Launching LibreSpeed (adolfintel/speedtest) container on port 3000..."
+            docker run -d \
+              --name speedtest \
+              -p 3000:80 \
+              --restart unless-stopped \
+              adolfintel/speedtest:latest
+            ENGINE_LABEL="LibreSpeed (HTML5)"
+          else
+            echo "ℹ️ Launching OpenSpeedTest (openspeedtest/latest) container on port 3000..."
+            docker run -d \
+              --name speedtest \
+              -p 3000:3000 \
+              --restart unless-stopped \
+              openspeedtest/latest
+            ENGINE_LABEL="OpenSpeedTest (HTML5 Network Benchmark)"
+          fi
+
+          echo "ENGINE_LABEL=$ENGINE_LABEL" >> $GITHUB_ENV
+
+          echo "⏳ Waiting for Speed Test server on port 3000 to respond..."
+          ready=false
+          for i in {1..30}; do
+            if curl -s http://localhost:3000 > /dev/null 2>&1; then
+              ready=true
+              echo "✅ Speed Test server is active and responding on port 3000!"
+              break
+            fi
+            echo "Attempt ${i}: waiting for Speed Test server..."
+            sleep 2
+          done
+
+          if [ "$(docker inspect -f '{{.State.Running}}' speedtest 2>/dev/null || true)" == "true" ]; then
+            echo "✅ Speed Test container is up and running!"
+          else
+            echo "❌ Speed Test container failed to start. Container logs:"
+            docker logs speedtest || true
+            exit 1
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 4: Setup Cloudflare Tunnel
+      # ───────────────────────────────────────────────
+      - name: 🌐 Setup Cloudflare Tunnel
+        id: cloudflare-tunnel
+        run: |
+          echo "⬇️ Downloading & installing cloudflared..."
+          curl -L -s --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+          rm -f cloudflared.deb
+
+          echo "🚀 Launching Cloudflare Tunnel for http://localhost:3000 ..."
+          rm -f /tmp/cloudflared.log
+          cloudflared tunnel --url http://localhost:3000 --logfile /tmp/cloudflared.log > /dev/null 2>&1 &
+
+          echo "⏳ Waiting for Cloudflare Tunnel URL..."
+          CF_URL=""
+          for i in {1..30}; do
+            sleep 2
+            if [ -f /tmp/cloudflared.log ]; then
+              CF_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' /tmp/cloudflared.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$CF_URL" ]; then
+                echo "✅ Found Cloudflare URL on attempt $i: $CF_URL"
+                break
+              fi
+            fi
+          done
+
+          if [ -n "$CF_URL" ]; then
+            echo ""
+            echo "================================================================="
+            echo "⚡ SPEED TEST WEB UI URL: $CF_URL"
+            echo "================================================================="
+            echo ""
+            echo "SPEEDTEST_URL=$CF_URL" >> $GITHUB_ENV
+          else
+            echo "⚠️ Cloudflare Tunnel URL could not be extracted within time limit."
+            if [ -f /tmp/cloudflared.log ]; then
+              echo "--- Cloudflare Log Content ---"
+              cat /tmp/cloudflared.log || true
+            fi
+            echo "SPEEDTEST_URL=Not Available" >> $GITHUB_ENV
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 5: Send Details to Telegram
+      # ───────────────────────────────────────────────
+      - name: 📲 Send Details to Telegram
+        run: |
+          botToken="${{ secrets.TELEGRAM_BOT_TOKEN }}"
+          chatId="${{ secrets.TELEGRAM_CHAT_ID }}"
+
+          if [ -z "$botToken" ] || [ -z "$chatId" ]; then
+            echo "⚠️ Telegram secrets not set. Skipping notification."
+          else
+            message="🚀 <b>Internet Speed Test Server Ready!</b>"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="🔗 Web UI URL: <code>${SPEEDTEST_URL}</code>"$'\n'
+            message+="⚡ Engine: <code>${ENGINE_LABEL}</code>"$'\n'
+
+            if [ -n "${RUNNER_PING}" ] && [ "${RUNNER_PING}" != "N/A" ]; then
+              message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+              message+="📊 <b>Runner Internet Speed:</b>"$'\n'
+              message+="⚡ Ping: <code>${RUNNER_PING}</code>"$'\n'
+              message+="📥 Download: <code>${RUNNER_DL}</code>"$'\n'
+              message+="📤 Upload: <code>${RUNNER_UL}</code>"$'\n'
+            fi
+
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⏱️ Uptime: ~5h 50m"$'\n'
+            message+="🔁 Run: #${{ github.run_number }}"$'\n'
+            message+="━━━━━━━━━━━━━━━━━━━━"$'\n'
+            message+="⚡ <i>Powered by Redwanul Haque</i>"
+
+            payload=$(jq -n \
+              --arg chat_id "$chatId" \
+              --arg text "$message" \
+              --arg parse_mode "HTML" \
+              '{chat_id: $chat_id, text: $text, parse_mode: $parse_mode}')
+
+            curl -s -X POST "https://api.telegram.org/bot${botToken}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "$payload" > /dev/null || true
+            echo "✅ Telegram notification sent!"
+          fi
+
+      # ───────────────────────────────────────────────
+      # Step 6: Print Details & Keep Alive
+      # ───────────────────────────────────────────────
+      - name: 📢 Print Details & Keep Alive
+        run: |
+          echo ""
+          echo "================================================================="
+          echo "⚡ Powered by Redwanul Haque"
+          echo "-----------------------------------------------------------------"
+          echo "Engine:         ${ENGINE_LABEL}"
+          echo "Speed Test URL: ${SPEEDTEST_URL}"
+          if [ -n "${RUNNER_PING}" ] && [ "${RUNNER_PING}" != "N/A" ]; then
+            echo "Runner Ping:    ${RUNNER_PING}"
+            echo "Runner DL:      ${RUNNER_DL}"
+            echo "Runner UL:      ${RUNNER_UL}"
+          fi
+          echo "================================================================="
+          echo ""
+
+          m=350
+          for i in $(seq 1 $m); do
+            l=$((m - i))
+            pct=$((i * 100 / m))
+            echo "[$(date +'%H:%M:%S')] ⏱️ $l min remaining ($pct% elapsed)"
+            sleep 60
+          done
+
+      # ───────────────────────────────────────────────
+      # Step 7: Chain Rotation Engine
+      # ───────────────────────────────────────────────
+      - name: 🔁 Chain Rotation Engine
+        if: ${{ !cancelled() }}
+        run: |
+          token="${{ secrets.GH_PAT }}"
+          inputLoops="${{ github.event.inputs.loops }}"
+          if [ -z "$inputLoops" ]; then
+            loops=4
+          else
+            loops=$inputLoops
+          fi
+
+          if [ "$loops" -le 1 ]; then
+            echo "🎯 Chain Finished Successfully. Total iterations completed."
+            exit 0
+          fi
+
+          if [ -z "$token" ] || [ ${#token} -lt 10 ]; then
+            echo "❌ GH_PAT secret is missing. Cannot dispatch next iteration."
+            exit 1
+          fi
+
+          next=$((loops - 1))
+          engine="${SELECTED_ENGINE:-openspeedtest}"
+          echo "🔁 Dispatching next iteration ($engine): $next remaining..."
+
+          payload=$(jq -n \
+            --arg ref "${{ github.ref_name }}" \
+            --arg engine "$engine" \
+            --arg next "$next" \
+            '{ref: $ref, inputs: {engine: $engine, loops: $next}}')
+
+          response=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/internet-speed-test-server.yml/dispatches" \
+            -H "Authorization: Bearer $token" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            -d "$payload")
+
+          http_code=$(echo "$response" | tail -n 1)
+          body=$(echo "$response" | sed '$d')
+
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "✅ Secured handoff executed to loop iteration: $next"
+          else
+            echo "⚠️ Chain dispatch returned HTTP status $http_code:"
+            echo "$body"
+            echo "💡 Tip: Make sure .github/workflows/internet-speed-test-server.yml is committed and pushed to your GitHub repository's default branch."
+          fi

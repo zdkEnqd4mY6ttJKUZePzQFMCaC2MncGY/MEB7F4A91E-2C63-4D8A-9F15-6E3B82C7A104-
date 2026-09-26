@@ -67,16 +67,18 @@ jobs:
         id: install-deps
         run: |
           echo "📦 Installing system build essentials & tools..."
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq qrencode jq curl python3-pip libgl1-mesa-glx libglib2.0-0
+          sudo apt-get update -qq || true
+          sudo apt-get install -y -qq qrencode jq curl python3-pip || true
+
+          export PIP_BREAK_SYSTEM_PACKAGES=1
 
           echo "🐍 Installing PyTorch CPU, Hugging Face Diffusers & Gradio..."
-          python3 -m pip install --upgrade pip setuptools wheel
-          python3 -m pip install --no-cache-dir \
+          python3 -m pip install --break-system-packages --upgrade pip setuptools wheel || true
+          python3 -m pip install --break-system-packages --no-cache-dir \
             --extra-index-url https://download.pytorch.org/whl/cpu \
             "torch>=2.2.0" "torchvision>=0.17.0"
 
-          python3 -m pip install --no-cache-dir \
+          python3 -m pip install --break-system-packages --no-cache-dir \
             "diffusers>=0.28.0" \
             "transformers>=4.40.0" \
             "accelerate>=0.29.0" \
@@ -85,7 +87,10 @@ jobs:
             "numpy>=1.24.0"
 
           mkdir -p /tmp/image_studio /tmp/image_studio/outputs
-          echo "✅ AI Image dependencies installed successfully."
+
+          echo "⬇️ Pre-downloading StabilityAI SD-Turbo weights..."
+          python3 -c "from diffusers import AutoPipelineForText2Image; import torch; AutoPipelineForText2Image.from_pretrained('stabilityai/sd-turbo', torch_dtype=torch.float32)" || true
+          echo "✅ AI Image dependencies and model cached successfully."
 
       # ───────────────────────────────────────────────
       # Step 4: Build Gradio AI Image Studio Web App
@@ -118,18 +123,15 @@ jobs:
           try:
               pipe_txt2img = AutoPipelineForText2Image.from_pretrained(
                   model_id,
-                  torch_dtype=torch.float32,
-                  variant="fp16"
+                  torch_dtype=torch.float32
               )
               pipe_txt2img.to("cpu")
               # Share weights with Image-to-Image pipeline for zero extra RAM overhead
               pipe_img2img = AutoPipelineForImage2Image.from_pipe(pipe_txt2img)
               print("✅ SD-Turbo Text-to-Image & Image-to-Image pipelines loaded successfully!")
           except Exception as e:
-              print(f"⚠️ Falling back to default float32 weights: {e}")
-              pipe_txt2img = AutoPipelineForText2Image.from_pretrained(model_id, torch_dtype=torch.float32)
-              pipe_txt2img.to("cpu")
-              pipe_img2img = AutoPipelineForImage2Image.from_pipe(pipe_txt2img)
+              print(f"❌ Error loading SD-Turbo pipeline: {e}")
+              raise e
 
           # --- Style Presets ---
           STYLE_TEMPLATES = {

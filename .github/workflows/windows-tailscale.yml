@@ -1,0 +1,140 @@
+name: Windows + Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "How long to keep the runner alive (max 350)"
+        required: true
+        default: "350"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 360   # GitHub-hosted maximum
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          hostname: gh-windows-${{ github.run_id }}
+
+      - name: Show Tailscale status
+        shell: pwsh
+        run: |
+          tailscale status
+          tailscale ip -4
+
+      - name: Enable Remote Desktop
+        shell: pwsh
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          net user runneradmin "${{ secrets.RDP_PASSWORD }}"
+
+      - name: Create folders on D drive
+        shell: pwsh
+        run: |
+          $base = "D:\SOURAV"
+          $folders = @(
+            "Video",
+            "Audio",
+            "Documents",
+            "Pictures",
+            "Downloads",
+            "Projects",
+            "Tools",
+            "Backup"
+          )
+
+          New-Item -ItemType Directory -Path $base -Force | Out-Null
+          foreach ($f in $folders) {
+              New-Item -ItemType Directory -Path (Join-Path $base $f) -Force | Out-Null
+          }
+
+          Write-Host "Folder structure created:"
+          Get-ChildItem $base | ForEach-Object { Write-Host " - $($_.FullName)" }
+
+      - name: Create desktop shortcut
+        shell: pwsh
+        run: |
+          $ws = New-Object -ComObject WScript.Shell
+          $lnk = $ws.CreateShortcut("$env:PUBLIC\Desktop\SOURAV.lnk")
+          $lnk.TargetPath = "D:\SOURAV"
+          $lnk.Save()
+
+      - name: Keep runner alive
+        shell: pwsh
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          $total = [int]"${{ github.event.inputs.minutes }}"
+          if ($total -gt 350) { $total = 350 }   # stay under the 6h job limit
+
+          $ip      = (tailscale ip -4).Trim()
+          $host_   = "gh-windows-${{ github.run_id }}"
+          $start   = Get-Date
+          $end     = $start.AddMinutes($total)
+
+          $info = @"
+           Tailscale IP   : $ip
+           Tailscale host : $host_
+           RDP user       : runneradmin
+           Started at     : $($start.ToString('yyyy-MM-dd HH:mm:ss'))
+           Ends at        : $($end.ToString('yyyy-MM-dd HH:mm:ss'))
+           Total time     : $total min
+           Work folder    : D:\SOURAV
+          "@
+
+          Write-Host "=============================================="
+          Write-Host $info
+          Write-Host "=============================================="
+
+          # Optional Telegram notification (only if both secrets are set)
+          function Send-Telegram([string]$text) {
+              if ([string]::IsNullOrWhiteSpace($env:TG_TOKEN) -or [string]::IsNullOrWhiteSpace($env:TG_CHAT_ID)) {
+                  return
+              }
+              try {
+                  Invoke-RestMethod -Method Post `
+                      -Uri "https://api.telegram.org/bot$($env:TG_TOKEN)/sendMessage" `
+                      -Body @{ chat_id = $env:TG_CHAT_ID; text = $text } | Out-Null
+                  Write-Host "Telegram message sent."
+              } catch {
+                  Write-Host "Telegram message failed: $($_.Exception.Message)"
+              }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TG_TOKEN) -or [string]::IsNullOrWhiteSpace($env:TG_CHAT_ID)) {
+              Write-Host "Telegram not configured, skipping notification."
+          } else {
+              Send-Telegram ("Windows runner is ready`n`n" + $info)
+          }
+
+          while ((Get-Date) -lt $end) {
+              $now       = Get-Date
+              $elapsed   = [int]($now - $start).TotalMinutes
+              $remaining = [int]($end - $now).TotalMinutes
+              $percent   = [int](($elapsed / $total) * 100)
+
+              Write-Host ("[{0}] IP: {1} | Elapsed: {2} min | Left: {3} min | {4}% done" -f `
+                  $now.ToString('HH:mm:ss'), $ip, $elapsed, $remaining, $percent)
+
+              Start-Sleep -Seconds 60
+          }
+
+          Write-Host "Time is up. Shutting down the runner."
+          Send-Telegram "Time is up. The Windows runner ($host_) is shutting down."
+
+      - name: Save SOURAV folder
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sourav-files
+          path: D:\SOURAV
+          if-no-files-found: ignore
